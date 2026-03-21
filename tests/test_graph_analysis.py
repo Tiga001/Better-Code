@@ -5,7 +5,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from bettercode.graph_analysis import analyze_graph_structure
+from bettercode.graph_analysis import analyze_graph_structure, decompose_subsystems
 from bettercode.parser import ProjectAnalyzer
 
 
@@ -46,6 +46,27 @@ class GraphAnalysisTests(unittest.TestCase):
         self.assertEqual(insights.incoming_internal_counts["file:leaf.py"], 1)
         self.assertEqual(insights.outgoing_internal_counts["file:leaf.py"], 0)
         self.assertEqual(len(insights.cycle_edge_ids), 3)
+
+    def test_decomposes_internal_files_into_connected_subsystems(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "alpha.py").write_text("import beta\n", encoding="utf-8")
+            (root / "beta.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "gamma.py").write_text("VALUE = 2\n", encoding="utf-8")
+            (root / "delta.py").write_text("import epsilon\n", encoding="utf-8")
+            (root / "epsilon.py").write_text("VALUE = 3\n", encoding="utf-8")
+            (root / "entry.py").write_text("import requests\nimport gamma\n", encoding="utf-8")
+
+            graph = ProjectAnalyzer().analyze(root)
+            subsystems = decompose_subsystems(graph)
+
+        self.assertEqual(len(subsystems), 3)
+        self.assertEqual(subsystems[0].member_paths, ["alpha.py", "beta.py"])
+        self.assertEqual(subsystems[1].member_paths, ["delta.py", "epsilon.py"])
+        self.assertEqual(subsystems[2].member_paths, ["entry.py", "gamma.py"])
+        self.assertEqual(subsystems[0].index, 1)
+        self.assertEqual(subsystems[1].index, 2)
+        self.assertEqual(subsystems[2].index, 3)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from bettercode.models import AgentTaskSuitability, CodeBlockKind, ImportKind, NodeKind
+from bettercode.models import AgentTaskSuitability, CodeBlockKind, ImportKind, NodeKind, UsageKind
 from bettercode.parser import ProjectAnalyzer
 
 
@@ -42,7 +42,7 @@ class ProjectAnalyzerTests(unittest.TestCase):
             graph = ProjectAnalyzer().analyze(root)
 
         node_kinds = {node.id: node.kind for node in graph.nodes}
-        self.assertEqual(node_kinds["file:main.py"], NodeKind.PYTHON_FILE)
+        self.assertEqual(node_kinds["file:main.py"], NodeKind.TOP_LEVEL_SCRIPT)
         self.assertEqual(node_kinds["file:pkg/__init__.py"], NodeKind.PYTHON_FILE)
         self.assertEqual(node_kinds["file:pkg/helpers.py"], NodeKind.LEAF_FILE)
         self.assertEqual(node_kinds["file:lonely.py"], NodeKind.PYTHON_FILE)
@@ -84,6 +84,148 @@ class ProjectAnalyzerTests(unittest.TestCase):
         self.assertEqual(import_kinds["pathlib.Path"], ImportKind.STANDARD_LIBRARY)
         self.assertEqual(import_kinds["core.VALUE"], ImportKind.INTERNAL)
         self.assertNotIn("external:tests", {node.id for node in graph.nodes})
+
+    def test_src_layout_modules_are_not_treated_as_external_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "src" / "myapp").mkdir(parents=True)
+            (root / "src" / "myapp" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "src" / "myapp" / "helpers.py").write_text(
+                textwrap.dedent(
+                    """
+                    def normalize(value: str) -> str:
+                        return value.strip()
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "src" / "myapp" / "service.py").write_text(
+                textwrap.dedent(
+                    """
+                    import myapp.helpers
+                    from myapp.helpers import normalize
+
+                    def run(value: str) -> str:
+                        return normalize(value)
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            graph = ProjectAnalyzer().analyze(root)
+
+        self.assertNotIn("external:myapp", {node.id for node in graph.nodes})
+        self.assertEqual(graph.file_details["file:src/myapp/service.py"].module, "myapp.service")
+        import_kinds = {record.module: record.kind for record in graph.file_details["file:src/myapp/service.py"].imports}
+        self.assertEqual(import_kinds["myapp.helpers"], ImportKind.INTERNAL)
+        self.assertEqual(import_kinds["myapp.helpers.normalize"], ImportKind.INTERNAL)
+
+    def test_same_directory_bare_import_resolves_to_internal_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "ui").mkdir()
+            (root / "ui" / "DICT2MODEL.py").write_text(
+                "def Conf2MODEL(config):\n    return config\n",
+                encoding="utf-8",
+            )
+            (root / "ui" / "JSONdemo.py").write_text(
+                textwrap.dedent(
+                    """
+                    from DICT2MODEL import Conf2MODEL
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            graph = ProjectAnalyzer().analyze(root)
+
+        detail = graph.file_details["file:ui/JSONdemo.py"]
+        import_record = next(record for record in detail.imports if record.module == "DICT2MODEL.Conf2MODEL")
+        self.assertEqual(import_record.kind, ImportKind.INTERNAL)
+        self.assertEqual(import_record.target_node_id, "file:ui/DICT2MODEL.py")
+        self.assertNotIn("external:dict2model", {node.id for node in graph.nodes})
+
+    def test_sibling_package_import_resolves_with_container_directory_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "DemosPyCode" / "Data").mkdir(parents=True)
+            (root / "DemosPyCode" / "Data" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "DemosPyCode" / "Data" / "DataDemo1.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "DemosPyCode" / "Demo1.py").write_text(
+                textwrap.dedent(
+                    """
+                    from Data.DataDemo1 import VALUE
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            graph = ProjectAnalyzer().analyze(root)
+
+        detail = graph.file_details["file:DemosPyCode/Demo1.py"]
+        import_record = next(record for record in detail.imports if record.module == "Data.DataDemo1.VALUE")
+        self.assertEqual(import_record.kind, ImportKind.INTERNAL)
+        self.assertEqual(import_record.target_node_id, "file:DemosPyCode/Data/DataDemo1.py")
+        self.assertNotIn("external:data", {node.id for node in graph.nodes})
+
+    def test_uppercase_missing_import_is_unresolved_instead_of_external(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "main.py").write_text(
+                textwrap.dedent(
+                    """
+                    from Component import Components
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            graph = ProjectAnalyzer().analyze(root)
+
+        detail = graph.file_details["file:main.py"]
+        import_record = next(record for record in detail.imports if record.module == "Component.Components")
+        self.assertEqual(import_record.kind, ImportKind.UNRESOLVED)
+        self.assertNotIn("external:component", {node.id for node in graph.nodes})
+
+    def test_classifies_top_level_scripts_separately_from_dependency_leaves(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "shared.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "entry.py").write_text(
+                textwrap.dedent(
+                    """
+                    from shared import VALUE
+
+                    print(VALUE)
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "worker.py").write_text(
+                textwrap.dedent(
+                    """
+                    from shared import VALUE
+
+                    def run() -> int:
+                        return VALUE
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            graph = ProjectAnalyzer().analyze(root)
+
+        node_kinds = {node.id: node.kind for node in graph.nodes}
+        self.assertEqual(node_kinds["file:entry.py"], NodeKind.TOP_LEVEL_SCRIPT)
+        self.assertEqual(node_kinds["file:shared.py"], NodeKind.LEAF_FILE)
+        self.assertEqual(node_kinds["file:worker.py"], NodeKind.TOP_LEVEL_SCRIPT)
 
     def test_extracts_file_internal_code_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -202,6 +344,126 @@ class ProjectAnalyzerTests(unittest.TestCase):
         self.assertIn(
             ("run_method", "file:helper.py", helper_blocks["normalize"], "formatter.normalize", True),
             call_edges,
+        )
+
+    def test_collects_symbol_usages_for_imports_and_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "helper.py").write_text(
+                textwrap.dedent(
+                    """
+                    class Formatter:
+                        def normalize(self, value: str) -> str:
+                            return value.strip()
+
+                    def decorate(fn):
+                        return fn
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "service.py").write_text(
+                textwrap.dedent(
+                    """
+                    from helper import Formatter, decorate
+
+                    class Derived(Formatter):
+                        pass
+
+                    @decorate
+                    def run(value: Formatter) -> Formatter:
+                        formatter = Formatter()
+                        return formatter
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            graph = ProjectAnalyzer().analyze(root)
+
+        helper_blocks = {block.name: block.id for block in graph.file_details["file:helper.py"].code_blocks}
+        service_detail = graph.file_details["file:service.py"]
+        usages = {
+            (
+                usage.target_id,
+                usage.owner_block_id,
+                usage.line,
+                usage.usage_kind,
+                usage.expression,
+            )
+            for usage in service_detail.symbol_usages
+        }
+        run_block = next(block for block in service_detail.code_blocks if block.name == "run")
+        derived_block = next(block for block in service_detail.code_blocks if block.name == "Derived")
+
+        self.assertIn(
+            (helper_blocks["Formatter"], None, 1, UsageKind.IMPORT, "helper.Formatter"),
+            usages,
+        )
+        self.assertIn(
+            (helper_blocks["decorate"], None, 1, UsageKind.IMPORT, "helper.decorate"),
+            usages,
+        )
+        self.assertIn(
+            (helper_blocks["Formatter"], derived_block.id, 3, UsageKind.INHERITANCE, "Formatter"),
+            usages,
+        )
+        self.assertIn(
+            (helper_blocks["decorate"], run_block.id, 6, UsageKind.DECORATOR, "decorate"),
+            usages,
+        )
+        self.assertIn(
+            (helper_blocks["Formatter"], run_block.id, 7, UsageKind.TYPE_ANNOTATION, "Formatter"),
+            usages,
+        )
+        self.assertIn(
+            (helper_blocks["Formatter"], run_block.id, 8, UsageKind.INSTANTIATION, "Formatter"),
+            usages,
+        )
+
+    def test_collects_module_scope_instantiation_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "helper.py").write_text(
+                textwrap.dedent(
+                    """
+                    class Formatter:
+                        pass
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "service.py").write_text(
+                textwrap.dedent(
+                    """
+                    from helper import Formatter
+
+                    formatter = Formatter()
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            graph = ProjectAnalyzer().analyze(root)
+
+        helper_block = next(block for block in graph.file_details["file:helper.py"].code_blocks if block.name == "Formatter")
+        service_usages = {
+            (
+                usage.target_id,
+                usage.owner_block_id,
+                usage.line,
+                usage.usage_kind,
+                usage.expression,
+            )
+            for usage in graph.file_details["file:service.py"].symbol_usages
+        }
+        self.assertIn(
+            (helper_block.id, None, 3, UsageKind.INSTANTIATION, "Formatter"),
+            service_usages,
         )
 
 

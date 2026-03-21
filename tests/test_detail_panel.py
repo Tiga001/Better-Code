@@ -67,7 +67,7 @@ class DetailPanelTests(unittest.TestCase):
         panel.set_selection(graph, insights, next(node for node in graph.nodes if node.id == "file:helper.py"))
         self.assertEqual(
             [panel._dependents.item(index).text() for index in range(panel._dependents.count())],
-            ["main.py [Python file]"],
+            ["main.py [Top-level script]"],
         )
         self.assertEqual(
             [panel._classes.item(index).text() for index in range(panel._classes.count())],

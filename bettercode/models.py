@@ -9,6 +9,7 @@ class NodeKind(str, Enum):
     EXTERNAL_PACKAGE = "external_package"
     PYTHON_FILE = "python_file"
     LEAF_FILE = "leaf_file"
+    TOP_LEVEL_SCRIPT = "top_level_script"
 
 
 class ImportKind(str, Enum):
@@ -28,6 +29,21 @@ class AgentTaskSuitability(str, Enum):
     GOOD = "good"
     CAUTION = "caution"
     AVOID = "avoid"
+
+
+class UsageKind(str, Enum):
+    CALL = "call"
+    METHOD_CALL = "method_call"
+    INSTANTIATION = "instantiation"
+    INHERITANCE = "inheritance"
+    DECORATOR = "decorator"
+    TYPE_ANNOTATION = "type_annotation"
+    IMPORT = "import"
+
+
+class UsageConfidence(str, Enum):
+    EXACT = "exact"
+    PROBABLE = "probable"
 
 
 @dataclass(slots=True)
@@ -78,6 +94,19 @@ class CodeBlockCall:
 
 
 @dataclass(slots=True)
+class SymbolUsage:
+    target_id: str
+    target_node_id: str
+    source_node_id: str
+    line: int
+    expression: str
+    usage_kind: UsageKind
+    confidence: UsageConfidence
+    owner_block_id: str | None = None
+    is_cross_file: bool = False
+
+
+@dataclass(slots=True)
 class GraphNode:
     id: str
     kind: NodeKind
@@ -105,6 +134,7 @@ class FileDetail:
     functions: list[FunctionSummary]
     code_blocks: list[CodeBlockSummary]
     code_block_calls: list[CodeBlockCall]
+    symbol_usages: list[SymbolUsage]
     source_preview: str
     syntax_error: str | None = None
 

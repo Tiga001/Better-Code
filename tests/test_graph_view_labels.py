@@ -30,6 +30,9 @@ class GraphViewLabelTests(unittest.TestCase):
     def test_path_hint_uses_project_root_for_top_level_file(self) -> None:
         self.assertEqual(_path_hint("app.py"), "project root")
 
+    def test_path_hint_is_localized_for_top_level_file(self) -> None:
+        self.assertEqual(_path_hint("app.py", "zh"), "项目根目录")
+
 
 if __name__ == "__main__":
     unittest.main()

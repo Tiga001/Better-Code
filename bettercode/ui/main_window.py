@@ -15,16 +15,19 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from bettercode.graph_analysis import GraphInsights, analyze_graph_structure
+from bettercode.i18n import LanguageCode, tr
 from bettercode.models import FileDetail, GraphNode, NodeKind, ProjectGraph
 from bettercode.parser import ProjectAnalyzer
 from bettercode.ui.code_block_dialog import CodeBlockDialog
 from bettercode.ui.detail_panel import DetailPanel
 from bettercode.ui.graph_view import DependencyGraphView
+from bettercode.ui.subsystem_view import SubsystemCanvasView
 
 
 class LegendSwatch(QWidget):
@@ -64,6 +67,17 @@ class LegendSwatch(QWidget):
 
         if self._shape == "square":
             painter.drawRoundedRect(4, 4, 18, 18, 4, 4)
+        elif self._shape == "diamond":
+            painter.drawPolygon(
+                QPolygonF(
+                    [
+                        QPointF(13, 2),
+                        QPointF(23, 13),
+                        QPointF(13, 24),
+                        QPointF(3, 13),
+                    ]
+                )
+            )
         elif self._shape == "hex":
             painter.drawPolygon(
                 QPolygonF(
@@ -84,7 +98,13 @@ class LegendSwatch(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("BetterCode")
+        self._language: LanguageCode = "zh"
+        self._graph_mode = "dependency"
+        self._graph_modes = [
+            ("dependency", "graph_mode.dependency"),
+            ("subsystems", "graph_mode.subsystems"),
+        ]
+        self.setWindowTitle(tr(self._language, "app.name"))
         self.resize(1480, 920)
 
         self._analyzer = ProjectAnalyzer()
@@ -95,27 +115,39 @@ class MainWindow(QMainWindow):
         self._search_matches: list[str] = []
         self._search_match_index = -1
 
-        self._project_label = QLabel("Project: none")
-        self._status_label = QLabel("Status: idle")
-        self._nodes_label = QLabel("Nodes: 0")
-        self._duration_label = QLabel("Parse: -- ms")
-        self._cycles_label = QLabel("Cycle Files: 0")
-        self._isolated_label = QLabel("Isolated Files: 0")
+        self._title_label = QLabel()
+        self._language_label = QLabel()
+        self._language_selector = QComboBox()
+        self._import_button = QPushButton()
+        self._refresh_button = QPushButton()
 
         self._graph_view = DependencyGraphView()
-        self._detail_panel = DetailPanel()
+        self._subsystem_view = SubsystemCanvasView()
+        self._detail_panel = DetailPanel(language=self._language)
         self._search_input = QLineEdit()
         self._focus_filter = QComboBox()
-        self._search_result_label = QLabel("Matches: --")
-        self._next_match_button = QPushButton("Next Match")
-        self._reset_view_button = QPushButton("Reset View")
+        self._neighbor_label = QLabel()
+        self._neighbor_filter = QComboBox()
+        self._search_result_label = QLabel()
+        self._next_match_button = QPushButton()
+        self._reset_view_button = QPushButton()
+        self._graph_mode_buttons: dict[str, QPushButton] = {}
+        self._canvas_stack = QStackedWidget()
+        self._legend_labels: dict[str, QLabel] = {}
         self._splitter: QSplitter | None = None
+
         self._graph_view.node_selected.connect(self._handle_node_selected)
         self._graph_view.node_double_clicked.connect(self._open_code_block_dialog)
+        self._graph_view.background_clicked.connect(self._handle_graph_background_clicked)
+        self._subsystem_view.node_selected.connect(self._handle_node_selected)
+        self._subsystem_view.node_double_clicked.connect(self._open_code_block_dialog)
+        self._subsystem_view.background_clicked.connect(self._handle_graph_background_clicked)
+        self._language_selector.currentIndexChanged.connect(self._handle_language_changed)
 
         self._build_ui()
         self._apply_styles()
         self._set_graph_controls_enabled(False)
+        self._apply_language()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -130,41 +162,22 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(0, 0, 0, 0)
 
         title_wrap = QVBoxLayout()
-        title = QLabel("BetterCode")
-        title.setObjectName("title")
-        subtitle = QLabel("Import a Python project and render a file-level dependency graph.")
-        subtitle.setObjectName("subtitle")
-        subtitle.setWordWrap(True)
-        title_wrap.addWidget(title)
-        title_wrap.addWidget(subtitle)
+        self._title_label.setObjectName("title")
+        title_wrap.addWidget(self._title_label)
         header_layout.addLayout(title_wrap, stretch=1)
 
         actions_wrap = QHBoxLayout()
-        import_button = QPushButton("Import Project")
-        refresh_button = QPushButton("Refresh")
-        refresh_button.setProperty("variant", "secondary")
-        import_button.clicked.connect(self._select_project_directory)
-        refresh_button.clicked.connect(self._refresh_current_project)
-        actions_wrap.addWidget(import_button)
-        actions_wrap.addWidget(refresh_button)
+        self._language_label.setObjectName("metricText")
+        self._language_selector.setMinimumWidth(120)
+        self._refresh_button.setProperty("variant", "secondary")
+        self._import_button.clicked.connect(self._select_project_directory)
+        self._refresh_button.clicked.connect(self._refresh_current_project)
+        actions_wrap.addWidget(self._language_label)
+        actions_wrap.addWidget(self._language_selector)
+        actions_wrap.addWidget(self._import_button)
+        actions_wrap.addWidget(self._refresh_button)
         header_layout.addLayout(actions_wrap)
         root_layout.addWidget(header)
-
-        metrics = QWidget()
-        metrics.setObjectName("metricsStrip")
-        metrics_layout = QHBoxLayout(metrics)
-        metrics_layout.setContentsMargins(0, 0, 0, 0)
-        metrics_layout.setSpacing(10)
-        for label in [
-            self._project_label,
-            self._status_label,
-            self._nodes_label,
-            self._duration_label,
-            self._cycles_label,
-            self._isolated_label,
-        ]:
-            metrics_layout.addWidget(self._metric_card(label))
-        root_layout.addWidget(metrics)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -175,34 +188,25 @@ class MainWindow(QMainWindow):
         graph_layout = QVBoxLayout(graph_panel)
         graph_layout.setContentsMargins(16, 16, 16, 16)
         graph_layout.setSpacing(12)
-        graph_layout.addWidget(
-            self._panel_intro(
-                "Dependency Workspace",
-                "Search, filter, and read file-level relationships before drilling into a single file.",
-            )
-        )
 
         controls = QFrame()
         controls.setObjectName("toolbarCard")
         controls_layout = QHBoxLayout(controls)
         controls_layout.setContentsMargins(14, 14, 14, 14)
         controls_layout.setSpacing(10)
-        self._search_input.setPlaceholderText("Search file, path, or module...")
         self._search_input.textChanged.connect(self._handle_search_text_changed)
         self._search_input.returnPressed.connect(self._select_next_search_match)
-        self._focus_filter.addItem("All nodes", "all")
-        self._focus_filter.addItem("Internal files", "internal")
-        self._focus_filter.addItem("Dependency leaves", "leaf")
-        self._focus_filter.addItem("External packages", "external")
-        self._focus_filter.addItem("Cycle members", "cycle")
-        self._focus_filter.addItem("Isolated files", "isolated")
         self._focus_filter.currentIndexChanged.connect(self._handle_focus_filter_changed)
+        self._neighbor_label.setObjectName("metricText")
+        self._neighbor_filter.currentIndexChanged.connect(self._handle_neighbor_filter_changed)
         self._next_match_button.setProperty("variant", "secondary")
         self._next_match_button.clicked.connect(self._select_next_search_match)
         self._reset_view_button.setProperty("variant", "secondary")
-        self._reset_view_button.clicked.connect(self._graph_view.reset_view)
+        self._reset_view_button.clicked.connect(self._handle_reset_view)
         controls_layout.addWidget(self._search_input, stretch=1)
         controls_layout.addWidget(self._focus_filter)
+        controls_layout.addWidget(self._neighbor_label)
+        controls_layout.addWidget(self._neighbor_filter)
         controls_layout.addWidget(self._next_match_button)
         controls_layout.addWidget(self._reset_view_button)
         controls_layout.addWidget(self._search_result_label)
@@ -214,10 +218,10 @@ class MainWindow(QMainWindow):
         canvas_layout = QVBoxLayout(canvas_frame)
         canvas_layout.setContentsMargins(12, 12, 12, 12)
         canvas_layout.setSpacing(10)
-        canvas_label = QLabel("Dependency Graph")
-        canvas_label.setObjectName("canvasTitle")
-        canvas_layout.addWidget(canvas_label)
-        canvas_layout.addWidget(self._graph_view, stretch=1)
+        canvas_layout.addWidget(self._build_graph_mode_bar())
+        self._canvas_stack.addWidget(self._graph_view)
+        self._canvas_stack.addWidget(self._subsystem_view)
+        canvas_layout.addWidget(self._canvas_stack, stretch=1)
         graph_layout.addWidget(canvas_frame, stretch=1)
 
         detail_panel = QFrame()
@@ -225,12 +229,6 @@ class MainWindow(QMainWindow):
         detail_layout = QVBoxLayout(detail_panel)
         detail_layout.setContentsMargins(16, 16, 16, 16)
         detail_layout.setSpacing(12)
-        detail_layout.addWidget(
-            self._panel_intro(
-                "Node Inspector",
-                "Use this side to inspect syntax, dependencies, and the internal structure of one file.",
-            )
-        )
         detail_layout.addWidget(self._detail_panel)
 
         splitter.addWidget(graph_panel)
@@ -243,30 +241,6 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(root)
 
-    def _metric_card(self, content: QLabel) -> QFrame:
-        frame = QFrame()
-        frame.setObjectName("metricCard")
-        content.setObjectName("metricText")
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.addWidget(content)
-        return frame
-
-    def _panel_intro(self, title_text: str, subtitle_text: str) -> QWidget:
-        panel = QWidget()
-        panel.setObjectName("panelIntro")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        title = QLabel(title_text)
-        title.setObjectName("panelTitle")
-        subtitle = QLabel(subtitle_text)
-        subtitle.setObjectName("panelSubtitle")
-        subtitle.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        return panel
-
     def _build_legend(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("legendCard")
@@ -274,26 +248,48 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(16)
 
-        for swatch, label in [
-            (LegendSwatch(shape="circle", fill_color="#3559d1"), "Python file"),
-            (LegendSwatch(shape="hex", fill_color="#118c6a"), "Dependency leaf"),
-            (LegendSwatch(shape="square", fill_color="#ff8a3d"), "External package"),
-            (LegendSwatch(shape="circle", fill_color="#3559d1", outer_color="#ff5d6c"), "Cycle member"),
+        legend_items = [
+            ("legend.python_file", LegendSwatch(shape="circle", fill_color="#3559d1")),
+            ("legend.leaf_file", LegendSwatch(shape="hex", fill_color="#118c6a")),
+            ("legend.top_level_script", LegendSwatch(shape="diamond", fill_color="#9b4fd8")),
+            ("legend.external_package", LegendSwatch(shape="square", fill_color="#ff8a3d")),
+            ("legend.cycle_member", LegendSwatch(shape="circle", fill_color="#3559d1", outer_color="#ff5d6c")),
             (
+                "legend.isolated_file",
                 LegendSwatch(shape="circle", fill_color="#3559d1", outer_color="#a06dff", dashed_outer=True),
-                "Isolated file",
             ),
-        ]:
+        ]
+
+        for key, swatch in legend_items:
             item = QWidget()
             item_layout = QHBoxLayout(item)
             item_layout.setContentsMargins(0, 0, 0, 0)
             item_layout.setSpacing(6)
+            label = QLabel()
+            self._legend_labels[key] = label
             item_layout.addWidget(swatch)
-            item_layout.addWidget(QLabel(label))
+            item_layout.addWidget(label)
             layout.addWidget(item)
 
         layout.addStretch(1)
         return frame
+
+    def _build_graph_mode_bar(self) -> QWidget:
+        bar = QWidget()
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        for mode, translation_key in self._graph_modes:
+            button = QPushButton()
+            button.setCheckable(True)
+            button.setProperty("modeButton", True)
+            button.clicked.connect(lambda checked=False, current_mode=mode: self._set_graph_mode(current_mode))
+            self._graph_mode_buttons[mode] = button
+            layout.addWidget(button)
+
+        layout.addStretch(1)
+        return bar
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -356,11 +352,6 @@ class MainWindow(QMainWindow):
                 color: #c4d0e3;
                 font-size: 12px;
             }
-            QFrame#metricCard {
-                background: #111925;
-                border: 1px solid #1b2736;
-                border-radius: 12px;
-            }
             QLabel#metricText {
                 color: #7f93af;
                 font-size: 12px;
@@ -420,6 +411,19 @@ class MainWindow(QMainWindow):
             QPushButton[variant="secondary"]:hover {
                 background: #1a2638;
             }
+            QPushButton[modeButton="true"] {
+                background: #121b29;
+                color: #d7e4f6;
+                border: 1px solid #29405d;
+                border-radius: 16px;
+                padding: 8px 14px;
+                font-weight: 700;
+            }
+            QPushButton[modeButton="true"]:checked {
+                background: #1b3654;
+                color: #f7fbff;
+                border: 1px solid #69b4ff;
+            }
             QListWidget, QTextEdit, QLineEdit, QComboBox {
                 background: #141d2b;
                 border: 1px solid #202c3f;
@@ -428,11 +432,6 @@ class MainWindow(QMainWindow):
             QListWidget#detailList {
                 background: #0f1825;
                 border: 1px solid #2a3c53;
-            }
-            QTextEdit#detailPreview {
-                background: #0d1521;
-                border: 1px solid #2a3c53;
-                border-radius: 12px;
             }
             QListWidget#detailList::item {
                 padding: 4px 2px;
@@ -455,10 +454,92 @@ class MainWindow(QMainWindow):
             """
         )
 
+    def _apply_language(self) -> None:
+        self.setWindowTitle(tr(self._language, "app.name"))
+        self._title_label.setText(tr(self._language, "app.name"))
+        self._language_label.setText(tr(self._language, "language.label"))
+        self._import_button.setText(tr(self._language, "button.import_project"))
+        self._refresh_button.setText(tr(self._language, "button.refresh"))
+        self._next_match_button.setText(tr(self._language, "button.next_match"))
+        self._reset_view_button.setText(tr(self._language, "button.reset_view"))
+        self._neighbor_label.setText(tr(self._language, "neighbor.label"))
+        self._rebuild_graph_mode_buttons()
+        for key, label in self._legend_labels.items():
+            label.setText(tr(self._language, key))
+        self._search_input.setPlaceholderText(tr(self._language, "search.placeholder"))
+        self._detail_panel.set_language(self._language)
+        self._graph_view.set_language(self._language)
+        self._subsystem_view.set_language(self._language)
+        self._rebuild_language_selector()
+        self._rebuild_focus_filter()
+        self._rebuild_neighbor_filter()
+        self._refresh_search_label()
+        self._update_graph_mode_ui()
+
+    def _rebuild_language_selector(self) -> None:
+        current_data = self._language_selector.currentData()
+        self._language_selector.blockSignals(True)
+        self._language_selector.clear()
+        self._language_selector.addItem(tr(self._language, "language.en"), "en")
+        self._language_selector.addItem(tr(self._language, "language.zh"), "zh")
+        if current_data is None:
+            current_data = self._language
+        index = self._language_selector.findData(current_data)
+        self._language_selector.setCurrentIndex(index if index >= 0 else 0)
+        self._language_selector.blockSignals(False)
+
+    def _rebuild_focus_filter(self) -> None:
+        current_data = self._focus_filter.currentData() or "all"
+        self._focus_filter.blockSignals(True)
+        self._focus_filter.clear()
+        self._focus_filter.addItem(tr(self._language, "focus.all"), "all")
+        self._focus_filter.addItem(tr(self._language, "focus.internal"), "internal")
+        self._focus_filter.addItem(tr(self._language, "focus.leaf"), "leaf")
+        self._focus_filter.addItem(tr(self._language, "focus.external"), "external")
+        self._focus_filter.addItem(tr(self._language, "focus.cycle"), "cycle")
+        self._focus_filter.addItem(tr(self._language, "focus.isolated"), "isolated")
+        index = self._focus_filter.findData(current_data)
+        self._focus_filter.setCurrentIndex(index if index >= 0 else 0)
+        self._focus_filter.blockSignals(False)
+
+    def _rebuild_neighbor_filter(self) -> None:
+        current_data = self._neighbor_filter.currentData() or 1
+        self._neighbor_filter.blockSignals(True)
+        self._neighbor_filter.clear()
+        self._neighbor_filter.addItem(tr(self._language, "neighbor.one"), 1)
+        self._neighbor_filter.addItem(tr(self._language, "neighbor.two"), 2)
+        index = self._neighbor_filter.findData(current_data)
+        self._neighbor_filter.setCurrentIndex(index if index >= 0 else 0)
+        self._neighbor_filter.blockSignals(False)
+        neighbor_depth = int(self._neighbor_filter.currentData() or 1)
+        self._graph_view.set_neighbor_depth(neighbor_depth)
+        self._subsystem_view.set_neighbor_depth(neighbor_depth)
+
+    def _rebuild_graph_mode_buttons(self) -> None:
+        for mode, translation_key in self._graph_modes:
+            button = self._graph_mode_buttons[mode]
+            button.setText(tr(self._language, translation_key))
+            button.setChecked(mode == self._graph_mode)
+
+    def _refresh_search_label(self) -> None:
+        if self._graph is None or not self._search_input.text().strip():
+            self._search_result_label.setText(tr(self._language, "search.matches.empty"))
+            return
+        self._search_result_label.setText(
+            tr(self._language, "search.matches.value", count=len(self._search_matches))
+        )
+
+    def _handle_language_changed(self, _index: int) -> None:
+        language = self._language_selector.currentData()
+        if language not in {"en", "zh"} or language == self._language:
+            return
+        self._language = language
+        self._apply_language()
+
     def _select_project_directory(self) -> None:
         selected_directory = QFileDialog.getExistingDirectory(
             self,
-            "Select Python project directory",
+            tr(self._language, "dialog.select_project_directory"),
             str(self._current_project_path or Path.home()),
         )
         if selected_directory:
@@ -469,36 +550,37 @@ class MainWindow(QMainWindow):
             self._load_project(self._current_project_path)
 
     def _load_project(self, project_path: Path) -> None:
-        self._status_label.setText("Status: parsing...")
         try:
             graph = self._analyzer.analyze(project_path)
         except Exception as error:  # pragma: no cover
-            QMessageBox.critical(self, "Analysis failed", str(error))
-            self._status_label.setText("Status: failed")
+            QMessageBox.critical(self, tr(self._language, "dialog.analysis_failed"), str(error))
             return
 
         self._graph = graph
         self._insights = analyze_graph_structure(graph)
         self._current_project_path = project_path
-        self._project_label.setText(f"Project: {project_path}")
-        self._status_label.setText("Status: ready")
-        self._nodes_label.setText(f"Nodes: {len(graph.nodes)}")
-        self._duration_label.setText(f"Parse: {graph.project.parse_duration_ms} ms")
-        self._cycles_label.setText(f"Cycle Files: {len(self._insights.cycle_node_ids)}")
-        self._isolated_label.setText(f"Isolated Files: {len(self._insights.isolated_node_ids)}")
         self._graph_view.set_graph(graph, self._insights)
+        self._graph_view.set_language(self._language)
+        self._subsystem_view.set_graph(graph)
+        self._subsystem_view.set_language(self._language)
         self._set_graph_controls_enabled(True)
-        self._apply_focus_and_search(auto_select=True)
+        self._handle_node_selected(None)
+        self._apply_focus_and_search(auto_select=False)
+        self._update_graph_mode_ui()
 
     def _handle_node_selected(self, node_id: str | None) -> None:
         self._selected_node_id = node_id
         self._graph_view.select_node(node_id)
+        self._subsystem_view.select_node(node_id)
         if self._graph is None or node_id is None:
             self._detail_panel.clear_panel()
             return
 
         node = next((candidate for candidate in self._graph.nodes if candidate.id == node_id), None)
         self._detail_panel.set_selection(self._graph, self._insights, node)
+
+    def _handle_graph_background_clicked(self) -> None:
+        self._handle_node_selected(None)
 
     def _open_code_block_dialog(self, node_id: str) -> None:
         if self._graph is None or self._current_project_path is None:
@@ -517,6 +599,7 @@ class MainWindow(QMainWindow):
             graph=self._graph,
             node=node,
             detail=detail,
+            language=self._language,
             parent=self,
         )
         dialog.exec()
@@ -525,7 +608,51 @@ class MainWindow(QMainWindow):
         self._refresh_search_matches(auto_select=True)
 
     def _handle_focus_filter_changed(self, _index: int) -> None:
-        self._apply_focus_and_search(auto_select=True)
+        self._apply_focus_and_search(auto_select=False)
+
+    def _handle_neighbor_filter_changed(self, _index: int) -> None:
+        neighbor_depth = int(self._neighbor_filter.currentData() or 1)
+        self._graph_view.set_neighbor_depth(neighbor_depth)
+        self._subsystem_view.set_neighbor_depth(neighbor_depth)
+
+    def _set_graph_mode(self, mode: str) -> None:
+        if mode not in self._graph_mode_buttons:
+            return
+        self._graph_mode = mode
+        self._update_graph_mode_ui()
+
+    def _update_graph_mode_ui(self) -> None:
+        has_graph = self._graph is not None
+        for mode, button in self._graph_mode_buttons.items():
+            button.setChecked(mode == self._graph_mode)
+            button.setEnabled(has_graph)
+        self._reset_view_button.setEnabled(has_graph)
+        if self._graph_mode == "subsystems":
+            self._canvas_stack.setCurrentWidget(self._subsystem_view)
+        else:
+            self._canvas_stack.setCurrentWidget(self._graph_view)
+        if self._selected_node_id is None:
+            self._detail_panel.clear_panel()
+        else:
+            self._handle_node_selected(self._selected_node_id)
+        self._update_dependency_controls()
+
+    def _update_dependency_controls(self) -> None:
+        has_graph = self._graph is not None
+        dependency_mode = self._graph_mode == "dependency"
+        dependency_controls_enabled = has_graph and dependency_mode
+        self._search_input.setEnabled(dependency_controls_enabled)
+        self._focus_filter.setEnabled(dependency_controls_enabled)
+        self._neighbor_filter.setEnabled(has_graph)
+        self._neighbor_label.setEnabled(has_graph)
+        self._next_match_button.setEnabled(dependency_controls_enabled and bool(self._search_matches))
+        self._search_result_label.setEnabled(dependency_controls_enabled)
+
+    def _handle_reset_view(self) -> None:
+        if self._graph_mode == "subsystems":
+            self._subsystem_view.reset_view()
+            return
+        self._graph_view.reset_view()
 
     def _apply_focus_and_search(self, *, auto_select: bool) -> None:
         if self._graph is None or self._insights is None:
@@ -534,10 +661,10 @@ class MainWindow(QMainWindow):
         focused_node_ids = self._focused_node_ids()
         self._graph_view.set_focused_node_ids(focused_node_ids)
 
-        if focused_node_ids is not None and self._selected_node_id not in focused_node_ids:
+        if auto_select and focused_node_ids is not None and self._selected_node_id not in focused_node_ids:
             fallback_node_id = self._preferred_node_id(focused_node_ids)
             self._handle_node_selected(fallback_node_id)
-        elif self._selected_node_id is None:
+        elif self._selected_node_id is None and auto_select:
             fallback_node_id = self._preferred_node_id(focused_node_ids)
             self._handle_node_selected(fallback_node_id)
 
@@ -547,9 +674,9 @@ class MainWindow(QMainWindow):
         if self._graph is None:
             self._search_matches = []
             self._search_match_index = -1
-            self._search_result_label.setText("Matches: --")
             self._next_match_button.setEnabled(False)
             self._graph_view.set_search_match_node_ids(set())
+            self._refresh_search_label()
             return
 
         query = self._search_input.text().strip().lower()
@@ -563,9 +690,9 @@ class MainWindow(QMainWindow):
         if not query:
             self._search_matches = []
             self._search_match_index = -1
-            self._search_result_label.setText("Matches: --")
             self._next_match_button.setEnabled(False)
             self._graph_view.set_search_match_node_ids(set())
+            self._refresh_search_label()
             return
 
         self._search_matches = [
@@ -574,8 +701,8 @@ class MainWindow(QMainWindow):
             if self._node_matches_query(node, query)
         ]
         self._graph_view.set_search_match_node_ids(set(self._search_matches))
-        self._search_result_label.setText(f"Matches: {len(self._search_matches)}")
         self._next_match_button.setEnabled(bool(self._search_matches))
+        self._refresh_search_label()
 
         if not self._search_matches:
             self._search_match_index = -1
@@ -633,7 +760,7 @@ class MainWindow(QMainWindow):
         return any(query in haystack.lower() for haystack in haystacks)
 
     def _set_graph_controls_enabled(self, enabled: bool) -> None:
-        self._search_input.setEnabled(enabled)
-        self._focus_filter.setEnabled(enabled)
-        self._reset_view_button.setEnabled(enabled)
-        self._next_match_button.setEnabled(enabled and bool(self._search_matches))
+        self._update_dependency_controls()
+        if not enabled:
+            for button in self._graph_mode_buttons.values():
+                button.setEnabled(False)

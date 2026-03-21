@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from bettercode.models import NodeKind, ProjectGraph
+from bettercode.models import GraphNode, NodeKind, ProjectGraph
 
 
 @dataclass(slots=True)
@@ -14,6 +14,13 @@ class GraphInsights:
     outgoing_node_ids: dict[str, list[str]]
     incoming_internal_counts: dict[str, int]
     outgoing_internal_counts: dict[str, int]
+
+
+@dataclass(slots=True)
+class SubsystemSummary:
+    index: int
+    node_ids: list[str]
+    member_paths: list[str]
 
 
 def analyze_graph_structure(graph: ProjectGraph) -> GraphInsights:
@@ -62,6 +69,66 @@ def analyze_graph_structure(graph: ProjectGraph) -> GraphInsights:
         incoming_internal_counts=incoming_internal_counts,
         outgoing_internal_counts=outgoing_internal_counts,
     )
+
+
+def decompose_subsystems(graph: ProjectGraph) -> list[SubsystemSummary]:
+    internal_nodes = {
+        node.id: node
+        for node in graph.nodes
+        if node.kind is not NodeKind.EXTERNAL_PACKAGE
+    }
+    if not internal_nodes:
+        return []
+
+    adjacency: dict[str, set[str]] = {node_id: set() for node_id in internal_nodes}
+    for edge in graph.edges:
+        if edge.source not in internal_nodes or edge.target not in internal_nodes:
+            continue
+        adjacency[edge.source].add(edge.target)
+        adjacency[edge.target].add(edge.source)
+
+    components: list[list[str]] = []
+    visited: set[str] = set()
+    for node_id in sorted(internal_nodes, key=lambda current_id: _node_sort_key(internal_nodes[current_id])):
+        if node_id in visited:
+            continue
+        component: list[str] = []
+        queue = [node_id]
+        visited.add(node_id)
+        while queue:
+            current_id = queue.pop(0)
+            component.append(current_id)
+            for neighbor_id in sorted(adjacency[current_id]):
+                if neighbor_id in visited:
+                    continue
+                visited.add(neighbor_id)
+                queue.append(neighbor_id)
+        components.append(sorted(component, key=lambda current_id: _node_sort_key(internal_nodes[current_id])))
+
+    components.sort(
+        key=lambda component: (
+            -len(component),
+            _node_sort_key(internal_nodes[component[0]]) if component else "",
+        )
+    )
+
+    subsystem_summaries: list[SubsystemSummary] = []
+    for index, component in enumerate(components, start=1):
+        subsystem_summaries.append(
+            SubsystemSummary(
+                index=index,
+                node_ids=component,
+                member_paths=[
+                    internal_nodes[node_id].path or internal_nodes[node_id].label
+                    for node_id in component
+                ],
+            )
+        )
+    return subsystem_summaries
+
+
+def _node_sort_key(node: GraphNode) -> str:
+    return (node.path or node.label).lower()
 
 
 def _find_cycle_components(adjacency: dict[str, list[str]]) -> list[set[str]]:
