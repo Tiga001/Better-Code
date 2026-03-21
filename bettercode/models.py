@@ -31,6 +31,24 @@ class AgentTaskSuitability(str, Enum):
     AVOID = "avoid"
 
 
+class TaskMode(str, Enum):
+    OPTIMIZE = "optimize"
+    TRANSLATE = "translate"
+
+
+class TaskUnitKind(str, Enum):
+    FUNCTION = "function"
+    CLASS_GROUP = "class_group"
+    CYCLE_GROUP = "cycle_group"
+
+
+class DependencyMappingStatus(str, Enum):
+    MAPPED = "mapped"
+    CANDIDATE = "candidate"
+    STUB_REQUIRED = "stub_required"
+    BLOCKED = "blocked"
+
+
 class UsageKind(str, Enum):
     CALL = "call"
     METHOD_CALL = "method_call"
@@ -104,6 +122,98 @@ class SymbolUsage:
     confidence: UsageConfidence
     owner_block_id: str | None = None
     is_cross_file: bool = False
+
+
+@dataclass(slots=True)
+class TaskCandidate:
+    id: str
+    mode: TaskMode
+    target_block_id: str
+    target_node_id: str
+    source_language: str
+    target_language: str | None
+    suitability: AgentTaskSuitability
+    related_block_ids: list[str] = field(default_factory=list)
+    related_node_ids: list[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    acceptance_checks: list[str] = field(default_factory=list)
+    dependency_mapping_status: DependencyMappingStatus | None = None
+
+
+@dataclass(slots=True)
+class TaskBundle:
+    task: TaskCandidate
+    source_snippets: list[str]
+    related_files: list[str]
+    related_blocks: list[str]
+    usages: list[SymbolUsage]
+    dependencies: list[ImportRecord]
+    constraints: list[str]
+    acceptance_checks: list[str]
+
+
+@dataclass(slots=True)
+class TaskGraphUnit:
+    id: str
+    kind: TaskUnitKind
+    label: str
+    block_ids: list[str]
+    root_block_ids: list[str]
+    node_ids: list[str]
+    depends_on: list[str]
+    depended_on_by: list[str]
+    depth: int
+    reasons: list[str] = field(default_factory=list)
+    ready_to_run: bool = False
+
+
+@dataclass(slots=True)
+class TaskGraphEdge:
+    source: str
+    target: str
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TaskGraph:
+    units: list[TaskGraphUnit]
+    edges: list[TaskGraphEdge]
+
+
+@dataclass(slots=True)
+class TaskQueueItem:
+    id: str
+    unit_id: str
+    mode: TaskMode
+    label: str
+    target_block_ids: list[str]
+    target_node_ids: list[str]
+    depends_on: list[str]
+    depended_on_by: list[str]
+    depth: int
+    order_index: int
+    suitability: AgentTaskSuitability
+    risk: AgentTaskSuitability
+    reasons: list[str] = field(default_factory=list)
+    ready_to_run: bool = False
+
+
+@dataclass(slots=True)
+class TaskExecutionPlan:
+    mode: TaskMode
+    items: list[TaskQueueItem]
+
+
+@dataclass(slots=True)
+class TaskUnitPackage:
+    item: TaskQueueItem
+    related_files: list[str]
+    related_blocks: list[str]
+    source_snippets: list[str]
+    constraints: list[str]
+    acceptance_checks: list[str]
+    prerequisites: list[str]
 
 
 @dataclass(slots=True)

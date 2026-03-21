@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QSize, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -22,12 +24,22 @@ from PySide6.QtWidgets import (
 
 from bettercode.graph_analysis import GraphInsights, analyze_graph_structure
 from bettercode.i18n import LanguageCode, tr
-from bettercode.models import FileDetail, GraphNode, NodeKind, ProjectGraph
+from bettercode.model_config_store import load_model_config, save_model_config
+from bettercode.models import FileDetail, GraphNode, NodeKind, ProjectGraph, TaskMode
 from bettercode.parser import ProjectAnalyzer
+from bettercode.task_graph import (
+    build_task_execution_plan,
+    build_task_graph,
+    build_task_unit_package,
+    task_unit_package_to_dict,
+)
 from bettercode.ui.code_block_dialog import CodeBlockDialog
 from bettercode.ui.detail_panel import DetailPanel
 from bettercode.ui.graph_view import DependencyGraphView
+from bettercode.ui.model_config_dialog import ModelConfigDialog
 from bettercode.ui.subsystem_view import SubsystemCanvasView
+from bettercode.ui.task_detail_panel import TaskDetailPanel
+from bettercode.ui.task_graph_view import TaskGraphView
 
 
 class LegendSwatch(QWidget):
@@ -103,6 +115,7 @@ class MainWindow(QMainWindow):
         self._graph_modes = [
             ("dependency", "graph_mode.dependency"),
             ("subsystems", "graph_mode.subsystems"),
+            ("tasks", "graph_mode.tasks"),
         ]
         self.setWindowTitle(tr(self._language, "app.name"))
         self.resize(1480, 920)
@@ -110,7 +123,11 @@ class MainWindow(QMainWindow):
         self._analyzer = ProjectAnalyzer()
         self._graph: ProjectGraph | None = None
         self._insights: GraphInsights | None = None
+        self._task_graph = None
+        self._optimize_plan = None
+        self._translate_plan = None
         self._selected_node_id: str | None = None
+        self._selected_task_unit_id: str | None = None
         self._current_project_path: Path | None = None
         self._search_matches: list[str] = []
         self._search_match_index = -1
@@ -118,12 +135,15 @@ class MainWindow(QMainWindow):
         self._title_label = QLabel()
         self._language_label = QLabel()
         self._language_selector = QComboBox()
+        self._model_config_button = QPushButton()
         self._import_button = QPushButton()
         self._refresh_button = QPushButton()
 
         self._graph_view = DependencyGraphView()
         self._subsystem_view = SubsystemCanvasView()
+        self._task_graph_view = TaskGraphView()
         self._detail_panel = DetailPanel(language=self._language)
+        self._task_detail_panel = TaskDetailPanel(language=self._language)
         self._search_input = QLineEdit()
         self._focus_filter = QComboBox()
         self._neighbor_label = QLabel()
@@ -133,6 +153,7 @@ class MainWindow(QMainWindow):
         self._reset_view_button = QPushButton()
         self._graph_mode_buttons: dict[str, QPushButton] = {}
         self._canvas_stack = QStackedWidget()
+        self._detail_stack = QStackedWidget()
         self._legend_labels: dict[str, QLabel] = {}
         self._splitter: QSplitter | None = None
 
@@ -142,6 +163,9 @@ class MainWindow(QMainWindow):
         self._subsystem_view.node_selected.connect(self._handle_node_selected)
         self._subsystem_view.node_double_clicked.connect(self._open_code_block_dialog)
         self._subsystem_view.background_clicked.connect(self._handle_graph_background_clicked)
+        self._task_graph_view.unit_selected.connect(self._handle_task_unit_selected)
+        self._task_graph_view.background_clicked.connect(self._handle_graph_background_clicked)
+        self._task_detail_panel.export_requested.connect(self._export_task_unit_package)
         self._language_selector.currentIndexChanged.connect(self._handle_language_changed)
 
         self._build_ui()
@@ -170,10 +194,13 @@ class MainWindow(QMainWindow):
         self._language_label.setObjectName("metricText")
         self._language_selector.setMinimumWidth(120)
         self._refresh_button.setProperty("variant", "secondary")
+        self._model_config_button.setProperty("variant", "secondary")
         self._import_button.clicked.connect(self._select_project_directory)
         self._refresh_button.clicked.connect(self._refresh_current_project)
+        self._model_config_button.clicked.connect(self._open_model_config_dialog)
         actions_wrap.addWidget(self._language_label)
         actions_wrap.addWidget(self._language_selector)
+        actions_wrap.addWidget(self._model_config_button)
         actions_wrap.addWidget(self._import_button)
         actions_wrap.addWidget(self._refresh_button)
         header_layout.addLayout(actions_wrap)
@@ -221,6 +248,7 @@ class MainWindow(QMainWindow):
         canvas_layout.addWidget(self._build_graph_mode_bar())
         self._canvas_stack.addWidget(self._graph_view)
         self._canvas_stack.addWidget(self._subsystem_view)
+        self._canvas_stack.addWidget(self._task_graph_view)
         canvas_layout.addWidget(self._canvas_stack, stretch=1)
         graph_layout.addWidget(canvas_frame, stretch=1)
 
@@ -229,7 +257,9 @@ class MainWindow(QMainWindow):
         detail_layout = QVBoxLayout(detail_panel)
         detail_layout.setContentsMargins(16, 16, 16, 16)
         detail_layout.setSpacing(12)
-        detail_layout.addWidget(self._detail_panel)
+        self._detail_stack.addWidget(self._detail_panel)
+        self._detail_stack.addWidget(self._task_detail_panel)
+        detail_layout.addWidget(self._detail_stack)
 
         splitter.addWidget(graph_panel)
         splitter.addWidget(detail_panel)
@@ -458,6 +488,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(tr(self._language, "app.name"))
         self._title_label.setText(tr(self._language, "app.name"))
         self._language_label.setText(tr(self._language, "language.label"))
+        self._model_config_button.setText(tr(self._language, "task.button.configure_model"))
         self._import_button.setText(tr(self._language, "button.import_project"))
         self._refresh_button.setText(tr(self._language, "button.refresh"))
         self._next_match_button.setText(tr(self._language, "button.next_match"))
@@ -468,8 +499,10 @@ class MainWindow(QMainWindow):
             label.setText(tr(self._language, key))
         self._search_input.setPlaceholderText(tr(self._language, "search.placeholder"))
         self._detail_panel.set_language(self._language)
+        self._task_detail_panel.set_language(self._language)
         self._graph_view.set_language(self._language)
         self._subsystem_view.set_language(self._language)
+        self._task_graph_view.set_language(self._language)
         self._rebuild_language_selector()
         self._rebuild_focus_filter()
         self._rebuild_neighbor_filter()
@@ -514,6 +547,7 @@ class MainWindow(QMainWindow):
         neighbor_depth = int(self._neighbor_filter.currentData() or 1)
         self._graph_view.set_neighbor_depth(neighbor_depth)
         self._subsystem_view.set_neighbor_depth(neighbor_depth)
+        self._task_graph_view.set_neighbor_depth(neighbor_depth)
 
     def _rebuild_graph_mode_buttons(self) -> None:
         for mode, translation_key in self._graph_modes:
@@ -549,6 +583,16 @@ class MainWindow(QMainWindow):
         if self._current_project_path is not None:
             self._load_project(self._current_project_path)
 
+    def _open_model_config_dialog(self) -> None:
+        dialog = ModelConfigDialog(
+            language=self._language,
+            initial_config=load_model_config(),
+            parent=self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        save_model_config(dialog.model_config())
+
     def _load_project(self, project_path: Path) -> None:
         try:
             graph = self._analyzer.analyze(project_path)
@@ -558,13 +602,19 @@ class MainWindow(QMainWindow):
 
         self._graph = graph
         self._insights = analyze_graph_structure(graph)
+        self._task_graph = build_task_graph(graph)
+        self._optimize_plan = build_task_execution_plan(graph, mode=TaskMode.OPTIMIZE)
+        self._translate_plan = build_task_execution_plan(graph, mode=TaskMode.TRANSLATE)
         self._current_project_path = project_path
         self._graph_view.set_graph(graph, self._insights)
         self._graph_view.set_language(self._language)
         self._subsystem_view.set_graph(graph)
         self._subsystem_view.set_language(self._language)
+        self._task_graph_view.set_task_graph(self._task_graph)
+        self._task_graph_view.set_language(self._language)
         self._set_graph_controls_enabled(True)
         self._handle_node_selected(None)
+        self._handle_task_unit_selected(None)
         self._apply_focus_and_search(auto_select=False)
         self._update_graph_mode_ui()
 
@@ -579,7 +629,25 @@ class MainWindow(QMainWindow):
         node = next((candidate for candidate in self._graph.nodes if candidate.id == node_id), None)
         self._detail_panel.set_selection(self._graph, self._insights, node)
 
+    def _handle_task_unit_selected(self, unit_id: str | None) -> None:
+        self._selected_task_unit_id = unit_id
+        self._task_graph_view.select_unit(unit_id)
+        if self._task_graph is None or unit_id is None:
+            self._task_detail_panel.clear_panel()
+            return
+
+        unit = next((candidate for candidate in self._task_graph.units if candidate.id == unit_id), None)
+        self._task_detail_panel.set_selection(
+            task_graph=self._task_graph,
+            optimize_plan=self._optimize_plan,
+            translate_plan=self._translate_plan,
+            unit=unit,
+        )
+
     def _handle_graph_background_clicked(self) -> None:
+        if self._graph_mode == "tasks":
+            self._handle_task_unit_selected(None)
+            return
         self._handle_node_selected(None)
 
     def _open_code_block_dialog(self, node_id: str) -> None:
@@ -614,6 +682,7 @@ class MainWindow(QMainWindow):
         neighbor_depth = int(self._neighbor_filter.currentData() or 1)
         self._graph_view.set_neighbor_depth(neighbor_depth)
         self._subsystem_view.set_neighbor_depth(neighbor_depth)
+        self._task_graph_view.set_neighbor_depth(neighbor_depth)
 
     def _set_graph_mode(self, mode: str) -> None:
         if mode not in self._graph_mode_buttons:
@@ -629,12 +698,23 @@ class MainWindow(QMainWindow):
         self._reset_view_button.setEnabled(has_graph)
         if self._graph_mode == "subsystems":
             self._canvas_stack.setCurrentWidget(self._subsystem_view)
+            self._detail_stack.setCurrentWidget(self._detail_panel)
+        elif self._graph_mode == "tasks":
+            self._canvas_stack.setCurrentWidget(self._task_graph_view)
+            self._detail_stack.setCurrentWidget(self._task_detail_panel)
         else:
             self._canvas_stack.setCurrentWidget(self._graph_view)
-        if self._selected_node_id is None:
-            self._detail_panel.clear_panel()
+            self._detail_stack.setCurrentWidget(self._detail_panel)
+        if self._graph_mode == "tasks":
+            if self._selected_task_unit_id is None:
+                self._task_detail_panel.clear_panel()
+            else:
+                self._handle_task_unit_selected(self._selected_task_unit_id)
         else:
-            self._handle_node_selected(self._selected_node_id)
+            if self._selected_node_id is None:
+                self._detail_panel.clear_panel()
+            else:
+                self._handle_node_selected(self._selected_node_id)
         self._update_dependency_controls()
 
     def _update_dependency_controls(self) -> None:
@@ -651,6 +731,9 @@ class MainWindow(QMainWindow):
     def _handle_reset_view(self) -> None:
         if self._graph_mode == "subsystems":
             self._subsystem_view.reset_view()
+            return
+        if self._graph_mode == "tasks":
+            self._task_graph_view.reset_view()
             return
         self._graph_view.reset_view()
 
@@ -758,6 +841,52 @@ class MainWindow(QMainWindow):
     def _node_matches_query(self, node: GraphNode, query: str) -> bool:
         haystacks = [node.label, node.path or "", node.module or ""]
         return any(query in haystack.lower() for haystack in haystacks)
+
+    def _export_task_unit_package(self, unit_id: str, mode_value: str) -> None:
+        if self._graph is None or self._current_project_path is None:
+            return
+        try:
+            mode = TaskMode(mode_value)
+            package = build_task_unit_package(self._graph, unit_id=unit_id, mode=mode)
+        except Exception as error:  # pragma: no cover
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task_package.dialog.export_error_title"),
+                tr(self._language, "task_package.dialog.export_error_body", error=str(error)),
+            )
+            return
+
+        safe_unit_id = "".join(
+            character if character.isalnum() or character in {"-", "_", "."} else "_"
+            for character in f"{unit_id}.{mode.value}.task_unit_package"
+        )
+        file_name, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            tr(self._language, "task_package.dialog.export_title"),
+            str(self._current_project_path / f"{safe_unit_id}.json"),
+            tr(self._language, "task_package.dialog.export_filter"),
+        )
+        if not file_name:
+            return
+
+        try:
+            Path(file_name).write_text(
+                json.dumps(task_unit_package_to_dict(package), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task_package.dialog.export_error_title"),
+                tr(self._language, "task_package.dialog.export_error_body", error=str(error)),
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            tr(self._language, "task_package.dialog.export_success_title"),
+            tr(self._language, "task_package.dialog.export_success_body", path=file_name),
+        )
 
     def _set_graph_controls_enabled(self, enabled: bool) -> None:
         self._update_dependency_controls()

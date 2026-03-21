@@ -1,0 +1,157 @@
+{
+  "top_level_scripts": [
+    "run_demo.py",
+    "batch_runner.py"
+  ],
+  "leaf_files": [
+    "pkg/constants.py",
+    "pkg/decorators.py",
+    "pkg/models.py",
+    "pkg/dynamic_loader.py",
+    "pkg/Component.py"
+  ],
+  "ordinary_internal_files": [
+    "pkg/__init__.py",
+    "pkg/service.py",
+    "pkg/handlers.py",
+    "pkg/Dict2MODEL.py",
+    "pkg/cycle_a.py",
+    "pkg/cycle_b.py"
+  ],
+  "isolated_files": [
+    "orphan.py",
+    "broken_syntax.py"
+  ],
+  "cycle_groups": [
+    [
+      "pkg/cycle_a.py",
+      "pkg/cycle_b.py"
+    ]
+  ],
+  "syntax_error_files": [
+    "broken_syntax.py"
+  ],
+  "external_import_examples": [
+    {
+      "path": "pkg/service.py",
+      "imports": [
+        "requests"
+      ]
+    },
+    {
+      "path": "pkg/Dict2MODEL.py",
+      "imports": [
+        "numpy"
+      ]
+    }
+  ],
+  "stdlib_import_examples": [
+    {
+      "path": "batch_runner.py",
+      "imports": [
+        "json"
+      ]
+    },
+    {
+      "path": "pkg/service.py",
+      "imports": [
+        "asyncio"
+      ]
+    },
+    {
+      "path": "pkg/dynamic_loader.py",
+      "imports": [
+        "importlib",
+        "typing"
+      ]
+    }
+  ],
+  "unresolved_import_examples": [
+    {
+      "path": "pkg/dynamic_loader.py",
+      "imports": [
+        "GhostLib.GhostClient"
+      ]
+    }
+  ],
+  "mixed_case_internal_files": [
+    "pkg/Component.py",
+    "pkg/Dict2MODEL.py"
+  ],
+  "type_annotation_only_examples": [
+    {
+      "symbol": "pkg.models.AuditRecord",
+      "referenced_from": [
+        "pkg/handlers.py"
+      ],
+      "note": "Used only in the build_archive_name annotation."
+    }
+  ],
+  "symbol_usage_examples": [
+    {
+      "symbol": "pkg.service.summarize_records",
+      "references": [
+        {
+          "path": "pkg/__init__.py",
+          "kind": "import"
+        },
+        {
+          "path": "run_demo.py",
+          "kind": "import"
+        },
+        {
+          "path": "run_demo.py",
+          "kind": "call"
+        },
+        {
+          "path": "batch_runner.py",
+          "kind": "call"
+        }
+      ]
+    },
+    {
+      "symbol": "pkg.models.make_record",
+      "references": [
+        {
+          "path": "pkg/handlers.py",
+          "kind": "import"
+        },
+        {
+          "path": "pkg/handlers.py",
+          "kind": "call"
+        },
+        {
+          "path": "run_demo.py",
+          "kind": "call"
+        },
+        {
+          "path": "batch_runner.py",
+          "kind": "call"
+        }
+      ]
+    },
+    {
+      "symbol": "pkg.handlers.NormalizingHandler",
+      "references": [
+        {
+          "path": "pkg/handlers.py",
+          "kind": "instantiation"
+        },
+        {
+          "path": "pkg/service.py",
+          "kind": "import"
+        },
+        {
+          "path": "pkg/service.py",
+          "kind": "instantiation"
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "The fixture intentionally contains a syntax error, unresolved import, optional third-party imports, and a dynamic import.",
+    "The importlib-based load of pkg.Dict2MODEL in pkg/dynamic_loader.py is a static-analysis boundary and may not appear as a normal file dependency edge.",
+    "Mixed-case module names should still resolve to internal files when imported with matching case.",
+    "run_demo.py and batch_runner.py both use imported symbols at module scope to make file-level usages easier to detect."
+  ]
+}

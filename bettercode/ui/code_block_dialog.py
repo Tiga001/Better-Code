@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QDialog,
+    QFileDialog,
     QFrame,
     QHeaderView,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -23,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from bettercode.i18n import LanguageCode, tr
+from bettercode.model_config_store import load_model_config, save_model_config
 from bettercode.models import (
     AgentTaskSuitability,
     CodeBlockCall,
@@ -32,9 +37,20 @@ from bettercode.models import (
     GraphNode,
     ProjectGraph,
     SymbolUsage,
+    TaskBundle,
+    TaskCandidate,
+    TaskMode,
     UsageConfidence,
     UsageKind,
 )
+from bettercode.task_planner import build_task_bundle, build_task_candidates, task_bundle_to_dict
+from bettercode.translation_executor import (
+    ModelConfig,
+    TranslationConfigError,
+    TranslationExecutionError,
+    execute_translation,
+)
+from bettercode.ui.model_config_dialog import ModelConfigDialog
 
 
 class CodeBlockDialog(QDialog):
@@ -50,6 +66,7 @@ class CodeBlockDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self._language = language
+        self._project_root = project_root
         self._node = node
         self._detail = detail
         self._source_lines = self._load_source_lines(project_root / detail.path)
@@ -61,6 +78,13 @@ class CodeBlockDialog(QDialog):
         self._calls_by_source: dict[str, list[CodeBlockCall]] = {}
         self._calls_by_target: dict[str, list[CodeBlockCall]] = {}
         self._usages_by_target: dict[str, list[SymbolUsage]] = {}
+        self._task_candidate_lookup: dict[str, TaskCandidate] = {}
+        self._task_candidates_by_block_id: dict[str, list[TaskCandidate]] = (
+            build_task_candidates(graph) if graph is not None else {}
+        )
+        for candidates in self._task_candidates_by_block_id.values():
+            for candidate in candidates:
+                self._task_candidate_lookup[candidate.id] = candidate
         if graph is not None:
             for file_detail in graph.file_details.values():
                 self._details_by_node_id[file_detail.node_id] = file_detail
@@ -109,10 +133,22 @@ class CodeBlockDialog(QDialog):
         self._outgoing_calls = self._create_list_widget(max_height=110)
         self._incoming_calls = self._create_list_widget(max_height=110)
         self._usages = self._create_list_widget(max_height=130)
-        self._agent_notes = self._create_list_widget(max_height=110)
+        self._agent_notes = self._create_list_widget(max_height=160)
+        self._agent_notes.itemSelectionChanged.connect(self._handle_task_candidate_selection_changed)
         self._preview = QTextEdit()
         self._preview.setReadOnly(True)
         self._preview.setObjectName("dialogPreview")
+        self._export_task_bundle_button = QPushButton()
+        self._export_task_bundle_button.setObjectName("dialogActionButton")
+        self._export_task_bundle_button.clicked.connect(self._export_selected_task_bundle)
+        self._export_task_bundle_button.setEnabled(False)
+        self._run_translation_button = QPushButton()
+        self._run_translation_button.setObjectName("dialogActionButton")
+        self._run_translation_button.clicked.connect(self._run_selected_translation)
+        self._run_translation_button.setEnabled(False)
+        self._configure_model_button = QPushButton()
+        self._configure_model_button.setObjectName("dialogModeButton")
+        self._configure_model_button.clicked.connect(self._open_model_config_dialog)
 
         self._tree_title = QLabel()
         self._tree_title.setObjectName("dialogSectionTitle")
@@ -176,9 +212,7 @@ class CodeBlockDialog(QDialog):
             )
         )
         self._inspector_stack.addWidget(self._build_section_card(self._usages_title, self._usages, include_title=False))
-        self._inspector_stack.addWidget(
-            self._build_section_card(self._agent_notes_title, self._agent_notes, include_title=False)
-        )
+        self._inspector_stack.addWidget(self._build_task_candidate_card())
         analysis_layout.addWidget(self._inspector_stack)
         analysis_layout.addWidget(self._build_section_card(self._source_title, self._preview), stretch=1)
 
@@ -256,6 +290,19 @@ class CodeBlockDialog(QDialog):
                 color: #f8fbff;
                 border: 1px solid #7bc5ff;
             }
+            QPushButton#dialogActionButton {
+                background: #ff9640;
+                color: #08111e;
+                border: none;
+                border-radius: 12px;
+                padding: 9px 14px;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QPushButton#dialogActionButton:disabled {
+                background: #283648;
+                color: #8ea1ba;
+            }
             QTreeWidget, QTextEdit, QListWidget {
                 background: #0d1521;
                 border: 1px solid #29405d;
@@ -296,6 +343,9 @@ class CodeBlockDialog(QDialog):
         self._call_links_button.setText(tr(self._language, "code_blocks.section.block_call_links"))
         self._usages_button.setText(tr(self._language, "code_blocks.section.usages"))
         self._agent_notes_button.setText(tr(self._language, "code_blocks.section.agent_notes"))
+        self._export_task_bundle_button.setText(tr(self._language, "task.button.export_bundle"))
+        self._run_translation_button.setText(tr(self._language, "task.button.run_translation"))
+        self._configure_model_button.setText(tr(self._language, "task.button.configure_model"))
 
     def _populate_tree(self) -> None:
         self._tree.clear()
@@ -311,6 +361,8 @@ class CodeBlockDialog(QDialog):
             )
             self._set_list_content(self._usages, [], tr(self._language, "code_blocks.placeholder.no_usages"))
             self._set_list_content(self._agent_notes, [], tr(self._language, "code_blocks.placeholder.no_agent_notes"))
+            self._export_task_bundle_button.setEnabled(False)
+            self._run_translation_button.setEnabled(False)
             self._signature.setText(tr(self._language, "code_blocks.signature.value", signature="-"))
             self._lines.setText(tr(self._language, "code_blocks.lines.empty"))
             self._returns.setText(tr(self._language, "code_blocks.returns.empty"))
@@ -407,11 +459,8 @@ class CodeBlockDialog(QDialog):
             [self._usage_display(usage) for usage in usages],
             tr(self._language, "code_blocks.placeholder.no_usages"),
         )
-        self._set_list_content(
-            self._agent_notes,
-            block.agent_task_reasons,
-            tr(self._language, "code_blocks.placeholder.no_agent_notes"),
-        )
+        task_candidates = self._task_candidates_by_block_id.get(block.id, [])
+        self._populate_task_candidates(task_candidates, fallback_reasons=block.agent_task_reasons)
         self._preview.setPlainText(self._source_excerpt(block))
 
     def _source_excerpt(self, block: CodeBlockSummary) -> str:
@@ -515,6 +564,32 @@ class CodeBlockDialog(QDialog):
     def _usage_confidence_label(self, confidence: UsageConfidence) -> str:
         return tr(self._language, f"usage_confidence.{confidence.value}")
 
+    def _task_candidate_display(self, candidate: TaskCandidate) -> str:
+        mapping = (
+            tr(self._language, f"task.mapping.{candidate.dependency_mapping_status.value}")
+            if candidate.dependency_mapping_status is not None
+            else "-"
+        )
+        reasons = [f"- {reason}" for reason in candidate.reasons[:3]]
+        if len(candidate.reasons) > 3:
+            reasons.append("- ...")
+        return tr(
+            self._language,
+            "task.candidate.value",
+            mode=self._task_mode_label(candidate),
+            suitability=self._task_suitability_label(candidate.suitability),
+            mapping=mapping,
+            related_blocks=len(candidate.related_block_ids),
+            related_files=len(candidate.related_node_ids) + 1,
+            reasons="\n".join(reasons),
+        )
+
+    def _task_mode_label(self, candidate: TaskCandidate) -> str:
+        return tr(self._language, f"task.mode.{candidate.mode.value}")
+
+    def _task_suitability_label(self, suitability: AgentTaskSuitability) -> str:
+        return tr(self._language, f"task.suitability.{suitability.value}")
+
     def _build_summary_card(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("dialogPanel")
@@ -553,6 +628,23 @@ class CodeBlockDialog(QDialog):
         layout.addStretch(1)
         self._set_inspector_mode(0)
         return row
+
+    def _build_task_candidate_card(self) -> QFrame:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        layout.addWidget(self._agent_notes)
+        button_row = QWidget()
+        button_layout = QHBoxLayout(button_row)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(8)
+        button_layout.addStretch(1)
+        button_layout.addWidget(self._configure_model_button)
+        button_layout.addWidget(self._run_translation_button)
+        button_layout.addWidget(self._export_task_bundle_button)
+        layout.addWidget(button_row)
+        return self._build_section_card(self._agent_notes_title, container, include_title=False)
 
     def _build_section_card(self, title_label: QLabel, widget: QWidget, *, include_title: bool = True) -> QFrame:
         frame = QFrame()
@@ -622,6 +714,142 @@ class CodeBlockDialog(QDialog):
             return
         for item in items:
             widget.addItem(QListWidgetItem(item))
+
+    def _populate_task_candidates(
+        self,
+        task_candidates: list[TaskCandidate],
+        *,
+        fallback_reasons: list[str],
+    ) -> None:
+        self._agent_notes.clear()
+        if task_candidates:
+            for candidate in task_candidates:
+                item = QListWidgetItem(self._task_candidate_display(candidate))
+                item.setData(Qt.UserRole, candidate.id)
+                self._agent_notes.addItem(item)
+            self._agent_notes.setCurrentRow(0)
+            return
+
+        self._export_task_bundle_button.setEnabled(False)
+        self._run_translation_button.setEnabled(False)
+        fallback_items = fallback_reasons or [tr(self._language, "code_blocks.placeholder.no_agent_notes")]
+        for item_text in fallback_items:
+            item = QListWidgetItem(item_text)
+            item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+            self._agent_notes.addItem(item)
+
+    def _selected_task_candidate(self) -> TaskCandidate | None:
+        current_item = self._agent_notes.currentItem()
+        if current_item is None:
+            return None
+        candidate_id = current_item.data(Qt.UserRole)
+        if not candidate_id:
+            return None
+        return self._task_candidate_lookup.get(candidate_id)
+
+    def _handle_task_candidate_selection_changed(self) -> None:
+        candidate = self._selected_task_candidate()
+        self._export_task_bundle_button.setEnabled(candidate is not None)
+        self._run_translation_button.setEnabled(candidate is not None and candidate.mode is TaskMode.TRANSLATE)
+
+    def _export_selected_task_bundle(self) -> None:
+        candidate = self._selected_task_candidate()
+        if candidate is None or self._graph is None:
+            self._export_task_bundle_button.setEnabled(False)
+            return
+
+        bundle = build_task_bundle(self._graph, candidate)
+        suggested_name = f"{self._safe_task_filename(bundle)}.json"
+        file_name, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            tr(self._language, "task.dialog.export_title"),
+            str(self._project_root / suggested_name),
+            tr(self._language, "task.dialog.export_filter"),
+        )
+        if not file_name:
+            return
+
+        try:
+            Path(file_name).write_text(
+                json.dumps(task_bundle_to_dict(bundle), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task.dialog.export_error_title"),
+                tr(self._language, "task.dialog.export_error_body", error=str(error)),
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            tr(self._language, "task.dialog.export_success_title"),
+            tr(self._language, "task.dialog.export_success_body", path=file_name),
+        )
+
+    def _run_selected_translation(self) -> None:
+        candidate = self._selected_task_candidate()
+        if candidate is None or self._graph is None or candidate.mode is not TaskMode.TRANSLATE:
+            self._run_translation_button.setEnabled(False)
+            return
+
+        bundle = build_task_bundle(self._graph, candidate)
+        config = self._resolve_translation_config(interactive=True)
+        if config is None:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            result = execute_translation(bundle, project_root=self._project_root, config=config)
+        except (TranslationConfigError, TranslationExecutionError, OSError) as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task.dialog.translate_error_title"),
+                tr(self._language, "task.dialog.translate_error_body", error=str(error)),
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        QMessageBox.information(
+            self,
+            tr(self._language, "task.dialog.translate_success_title"),
+            tr(
+                self._language,
+                "task.dialog.translate_success_body",
+                status=result.status.value,
+                path=result.output_dir,
+            ),
+        )
+
+    def _open_model_config_dialog(self) -> None:
+        self._resolve_translation_config(interactive=True, force_dialog=True)
+
+    def _resolve_translation_config(
+        self,
+        *,
+        interactive: bool,
+        force_dialog: bool = False,
+    ) -> ModelConfig | None:
+        current = load_model_config()
+        needs_dialog = force_dialog or not current.api_token or not current.api_url or not current.model_name
+        if not needs_dialog:
+            return current
+        if not interactive:
+            return None
+
+        dialog = ModelConfigDialog(language=self._language, initial_config=current, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        config = dialog.model_config()
+        save_model_config(config)
+        return config
+
+    def _safe_task_filename(self, bundle: TaskBundle) -> str:
+        candidate = bundle.task
+        raw_name = f"{self._node.label}.{candidate.mode.value}.task_bundle"
+        safe_chars = [character if character.isalnum() or character in {"-", "_", "."} else "_" for character in raw_name]
+        return "".join(safe_chars)
 
     def _apply_chip_style(self, label: QLabel, tone: str) -> None:
         styles = {
