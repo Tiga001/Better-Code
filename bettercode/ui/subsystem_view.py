@@ -18,6 +18,7 @@ from bettercode.graph_analysis import SubsystemSummary, decompose_subsystems
 from bettercode.i18n import LanguageCode, tr
 from bettercode.models import GraphEdge, GraphNode, NodeKind, ProjectGraph
 from bettercode.ui.graph_view import GraphEdgeItem, GraphNodeItem, _preferred_grid_columns
+from bettercode.ui.scene_export import export_scene_image
 
 
 class SubsystemCanvasView(QGraphicsView):
@@ -44,6 +45,8 @@ class SubsystemCanvasView(QGraphicsView):
         self._max_scale = 3.5
         self._node_items: dict[str, GraphNodeItem] = {}
         self._edge_items: dict[str, GraphEdgeItem] = {}
+        self._focused_node_ids: set[str] | None = None
+        self._search_match_node_ids: set[str] = set()
         self._selected_node_id: str | None = None
         self._selected_related_node_levels: dict[str, int] = {}
         self._selected_related_edge_levels: dict[str, int] = {}
@@ -57,6 +60,8 @@ class SubsystemCanvasView(QGraphicsView):
         self._has_user_zoomed = False
         self._node_items.clear()
         self._edge_items.clear()
+        self._focused_node_ids = None
+        self._search_match_node_ids.clear()
         self._selected_node_id = None
         self._selected_related_node_levels.clear()
         self._selected_related_edge_levels.clear()
@@ -91,6 +96,14 @@ class SubsystemCanvasView(QGraphicsView):
             self.select_node(self._selected_node_id)
         else:
             self._apply_visual_state()
+
+    def set_focused_node_ids(self, node_ids: set[str] | None) -> None:
+        self._focused_node_ids = node_ids
+        self._apply_visual_state()
+
+    def set_search_match_node_ids(self, node_ids: set[str]) -> None:
+        self._search_match_node_ids = node_ids
+        self._apply_visual_state()
 
     def select_node(self, node_id: str | None) -> None:
         if node_id is not None and node_id not in self._node_items:
@@ -179,6 +192,9 @@ class SubsystemCanvasView(QGraphicsView):
         self.resetTransform()
         self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
         self._min_scale = min(0.35, self.transform().m11())
+
+    def export_image(self, output_path: str) -> None:
+        export_scene_image(view=self, scene=self._scene, output_path=output_path)
 
     def _render_empty_state(self) -> None:
         text_item = self._scene.addText(tr(self._language, "subsystem.empty"))
@@ -355,16 +371,18 @@ class SubsystemCanvasView(QGraphicsView):
         self._apply_visual_state()
 
     def _apply_visual_state(self) -> None:
+        active_node_ids = self._focused_node_ids
         for node_id, item in self._node_items.items():
             in_selected_context = (
                 self._selected_node_id is None
                 or node_id == self._selected_node_id
                 or node_id in self._selected_related_node_levels
             )
-            item.set_dimmed(not in_selected_context)
+            in_focus = active_node_ids is None or node_id in active_node_ids or (self._selected_node_id is not None and in_selected_context)
+            item.set_dimmed(not in_focus or not in_selected_context)
             item.set_selected(node_id == self._selected_node_id)
             item.set_neighbor_level(self._selected_related_node_levels.get(node_id, 0))
-            item.set_search_match(False)
+            item.set_search_match(node_id in self._search_match_node_ids)
             item.set_cycle_member(False)
             item.set_isolated(False)
 
@@ -375,7 +393,10 @@ class SubsystemCanvasView(QGraphicsView):
             in_selected_context = (
                 self._selected_node_id is None or edge.id in self._selected_related_edge_levels
             )
-            item.set_dimmed(not in_selected_context)
+            in_focus = active_node_ids is None or (
+                edge.source in active_node_ids and edge.target in active_node_ids
+            ) or (self._selected_node_id is not None and in_selected_context)
+            item.set_dimmed(not in_focus or not in_selected_context)
             item.set_neighbor_level(self._selected_related_edge_levels.get(edge.id, 0))
             item.set_cycle_member(False)
 

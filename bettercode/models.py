@@ -23,6 +23,7 @@ class CodeBlockKind(str, Enum):
     CLASS = "class"
     FUNCTION = "function"
     METHOD = "method"
+    MODULE_SCOPE = "module_scope"
 
 
 class AgentTaskSuitability(str, Enum):
@@ -39,7 +40,14 @@ class TaskMode(str, Enum):
 class TaskUnitKind(str, Enum):
     FUNCTION = "function"
     CLASS_GROUP = "class_group"
+    SCRIPT_BLOCK = "script_block"
     CYCLE_GROUP = "cycle_group"
+
+
+class TaskDependencyKind(str, Enum):
+    STRONG_CALL = "strong_call"
+    INHERITANCE = "inheritance"
+    IMPORT_ONLY = "import_only"
 
 
 class DependencyMappingStatus(str, Enum):
@@ -142,15 +150,30 @@ class TaskCandidate:
 
 
 @dataclass(slots=True)
+class TaskTargetBlock:
+    id: str
+    path: str
+    kind: CodeBlockKind
+    name: str
+    signature: str | None
+    start_line: int
+    end_line: int
+    source_text: str
+
+
+@dataclass(slots=True)
 class TaskBundle:
     task: TaskCandidate
     source_snippets: list[str]
     related_files: list[str]
     related_blocks: list[str]
+    target_blocks: list[TaskTargetBlock]
     usages: list[SymbolUsage]
     dependencies: list[ImportRecord]
     constraints: list[str]
     acceptance_checks: list[str]
+    editable_files: list[str] = field(default_factory=list)
+    context_files: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -164,6 +187,8 @@ class TaskGraphUnit:
     depends_on: list[str]
     depended_on_by: list[str]
     depth: int
+    context_depends_on: list[str] = field(default_factory=list)
+    context_depended_on_by: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     ready_to_run: bool = False
 
@@ -173,6 +198,8 @@ class TaskGraphEdge:
     source: str
     target: str
     reasons: list[str] = field(default_factory=list)
+    dependency_kinds: list[TaskDependencyKind] = field(default_factory=list)
+    is_blocking: bool = False
 
 
 @dataclass(slots=True)
@@ -195,6 +222,8 @@ class TaskQueueItem:
     order_index: int
     suitability: AgentTaskSuitability
     risk: AgentTaskSuitability
+    context_depends_on: list[str] = field(default_factory=list)
+    context_depended_on_by: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     ready_to_run: bool = False
 
@@ -206,14 +235,49 @@ class TaskExecutionPlan:
 
 
 @dataclass(slots=True)
+class TaskBatchItem:
+    id: str
+    unit_id: str
+    mode: TaskMode
+    label: str
+    phase_index: int
+    order_index: int
+    target_block_ids: list[str]
+    target_node_ids: list[str]
+    blocking_dependencies: list[str]
+    context_dependencies: list[str]
+    suitability: AgentTaskSuitability
+    risk: AgentTaskSuitability
+    reasons: list[str] = field(default_factory=list)
+    ready_to_run: bool = False
+
+
+@dataclass(slots=True)
+class TaskBatchPhase:
+    index: int
+    item_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TaskBatch:
+    mode: TaskMode
+    items: list[TaskBatchItem]
+    phases: list[TaskBatchPhase]
+
+
+@dataclass(slots=True)
 class TaskUnitPackage:
     item: TaskQueueItem
     related_files: list[str]
     related_blocks: list[str]
     source_snippets: list[str]
+    target_blocks: list[TaskTargetBlock]
     constraints: list[str]
     acceptance_checks: list[str]
     prerequisites: list[str]
+    context_dependencies: list[str] = field(default_factory=list)
+    editable_files: list[str] = field(default_factory=list)
+    context_files: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

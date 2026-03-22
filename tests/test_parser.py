@@ -227,6 +227,40 @@ class ProjectAnalyzerTests(unittest.TestCase):
         self.assertEqual(node_kinds["file:shared.py"], NodeKind.LEAF_FILE)
         self.assertEqual(node_kinds["file:worker.py"], NodeKind.TOP_LEVEL_SCRIPT)
 
+    def test_ignores_generated_validation_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "MainClasses.py").write_text(
+                "from LogsPage import LogPage\n",
+                encoding="utf-8",
+            )
+            (root / "LogsPage.py").write_text(
+                "import redis\nfrom CustomWidgets import Splitter\n",
+                encoding="utf-8",
+            )
+            generated_logs = (
+                root
+                / "generated"
+                / "optimizations"
+                / "task_unit_file_CustomWidgets.py_block_6_optimize"
+                / "validation_workspace"
+                / "LogsPage.py"
+            )
+            generated_logs.parent.mkdir(parents=True)
+            generated_logs.write_text(
+                "import redis\nfrom CustomWidgets import Splitter\n",
+                encoding="utf-8",
+            )
+
+            graph = ProjectAnalyzer().analyze(root)
+
+        node_ids = {node.id for node in graph.nodes}
+        self.assertIn("file:LogsPage.py", node_ids)
+        self.assertNotIn(
+            "file:generated/optimizations/task_unit_file_CustomWidgets.py_block_6_optimize/validation_workspace/LogsPage.py",
+            node_ids,
+        )
+
     def test_extracts_file_internal_code_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -283,6 +317,45 @@ class ProjectAnalyzerTests(unittest.TestCase):
         self.assertIn(("greet", "_normalize", "self._normalize"), call_edges)
         self.assertIn(("run", "Greeter", "Greeter"), call_edges)
         self.assertIn(("run", "greet", "Greeter().greet"), call_edges)
+
+    def test_resolves_inheritance_through_internal_star_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "Basement.py").write_text(
+                textwrap.dedent(
+                    """
+                    class Unit:
+                        pass
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "ModelLib.py").write_text(
+                textwrap.dedent(
+                    """
+                    from Basement import *
+
+                    class Heater(Unit):
+                        pass
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            graph = ProjectAnalyzer().analyze(root)
+
+        model_detail = graph.file_details["file:ModelLib.py"]
+        inheritance_usages = [
+            usage
+            for usage in model_detail.symbol_usages
+            if usage.usage_kind is UsageKind.INHERITANCE
+        ]
+        self.assertEqual(len(inheritance_usages), 1)
+        self.assertEqual(inheritance_usages[0].expression, "Unit")
+        self.assertEqual(inheritance_usages[0].target_id, "file:Basement.py#block:0")
+        self.assertEqual(inheritance_usages[0].target_node_id, "file:Basement.py")
 
     def test_resolves_cross_file_code_block_calls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -451,6 +524,9 @@ class ProjectAnalyzerTests(unittest.TestCase):
             graph = ProjectAnalyzer().analyze(root)
 
         helper_block = next(block for block in graph.file_details["file:helper.py"].code_blocks if block.name == "Formatter")
+        module_scope_block = next(
+            block for block in graph.file_details["file:service.py"].code_blocks if block.kind is CodeBlockKind.MODULE_SCOPE
+        )
         service_usages = {
             (
                 usage.target_id,
@@ -462,8 +538,62 @@ class ProjectAnalyzerTests(unittest.TestCase):
             for usage in graph.file_details["file:service.py"].symbol_usages
         }
         self.assertIn(
-            (helper_block.id, None, 3, UsageKind.INSTANTIATION, "Formatter"),
+            (helper_block.id, module_scope_block.id, 3, UsageKind.INSTANTIATION, "Formatter"),
             service_usages,
+        )
+
+    def test_extracts_module_scope_execution_block_and_cross_file_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "helper.py").write_text(
+                textwrap.dedent(
+                    """
+                    def normalize(value: str) -> str:
+                        return value.strip()
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "demo.py").write_text(
+                textwrap.dedent(
+                    """
+                    from helper import normalize
+
+                    VALUE = " ready "
+                    result = normalize(VALUE)
+                    if result:
+                        print(result)
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            graph = ProjectAnalyzer().analyze(root)
+
+        detail = graph.file_details["file:demo.py"]
+        self.assertEqual(len(detail.code_blocks), 1)
+        module_scope_block = detail.code_blocks[0]
+        self.assertEqual(module_scope_block.kind, CodeBlockKind.MODULE_SCOPE)
+        self.assertEqual(module_scope_block.line, 4)
+        self.assertEqual(module_scope_block.end_line, 6)
+        self.assertEqual(module_scope_block.agent_task_fit, AgentTaskSuitability.CAUTION)
+
+        helper_block = next(block for block in graph.file_details["file:helper.py"].code_blocks if block.name == "normalize")
+        self.assertIn(
+            (module_scope_block.id, helper_block.id, "normalize", True),
+            {
+                (call.source_id, call.target_id, call.expression, call.is_cross_file)
+                for call in detail.code_block_calls
+            },
+        )
+        self.assertIn(
+            (helper_block.id, module_scope_block.id, 4, UsageKind.CALL, "normalize"),
+            {
+                (usage.target_id, usage.owner_block_id, usage.line, usage.usage_kind, usage.expression)
+                for usage in detail.symbol_usages
+            },
         )
 
 

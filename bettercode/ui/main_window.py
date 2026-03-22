@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QSize, Qt
+from PySide6.QtCore import QObject, QPointF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -22,22 +23,48 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from bettercode.batch_optimize_executor import (
+    BatchRunItemStatus,
+    BatchRunReport,
+    BatchRunStatus,
+    create_batch_run_report,
+    write_batch_run_report,
+)
 from bettercode.graph_analysis import GraphInsights, analyze_graph_structure
 from bettercode.i18n import LanguageCode, tr
 from bettercode.model_config_store import load_model_config, save_model_config
-from bettercode.models import FileDetail, GraphNode, NodeKind, ProjectGraph, TaskMode
+from bettercode.models import FileDetail, GraphNode, NodeKind, ProjectGraph, TaskBatch, TaskBatchPhase, TaskMode
+from bettercode.optimize_executor import (
+    OptimizationConfigError,
+    OptimizationExecutionError,
+    apply_optimization_result,
+    execute_optimization,
+    rollback_optimization_result,
+)
+from bettercode.optimization_history import (
+    load_optimization_history,
+    load_saved_apply_result,
+    load_saved_optimization_result,
+    load_saved_rollback_result,
+)
 from bettercode.parser import ProjectAnalyzer
 from bettercode.task_graph import (
+    build_task_batch,
     build_task_execution_plan,
     build_task_graph,
     build_task_unit_package,
+    task_batch_to_dict,
     task_unit_package_to_dict,
 )
 from bettercode.ui.code_block_dialog import CodeBlockDialog
 from bettercode.ui.detail_panel import DetailPanel
 from bettercode.ui.graph_view import DependencyGraphView
+from bettercode.ui.batch_run_report_dialog import BatchRunReportDialog
+from bettercode.ui.batch_monitor_panel import BatchMonitorPanel
 from bettercode.ui.model_config_dialog import ModelConfigDialog
+from bettercode.ui.optimization_review_dialog import OptimizationReviewDialog
 from bettercode.ui.subsystem_view import SubsystemCanvasView
+from bettercode.ui.task_batch_view import TaskBatchView
 from bettercode.ui.task_detail_panel import TaskDetailPanel
 from bettercode.ui.task_graph_view import TaskGraphView
 
@@ -79,6 +106,27 @@ class LegendSwatch(QWidget):
 
         if self._shape == "square":
             painter.drawRoundedRect(4, 4, 18, 18, 4, 4)
+        elif self._shape == "edge_strong":
+            painter.setPen(QPen(self._fill_color, 2.4))
+            painter.drawLine(4, 13, 22, 13)
+            painter.setBrush(self._fill_color)
+            painter.drawPolygon(QPolygonF([QPointF(22, 13), QPointF(16, 10), QPointF(16, 16)]))
+        elif self._shape == "edge_inherit":
+            pen = QPen(self._fill_color, 2.2)
+            pen.setStyle(Qt.DotLine)
+            painter.setPen(pen)
+            painter.drawLine(4, 13, 22, 13)
+            painter.setBrush(self._fill_color)
+            painter.drawPolygon(QPolygonF([QPointF(22, 13), QPointF(16, 10), QPointF(16, 16)]))
+        elif self._shape == "edge_context":
+            pen = QPen(self._fill_color, 2.0)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(4, 13, 22, 13)
+            painter.setBrush(self._fill_color)
+            painter.drawPolygon(QPolygonF([QPointF(22, 13), QPointF(16, 10), QPointF(16, 16)]))
+        elif self._shape == "task_rect":
+            painter.drawRoundedRect(3, 5, 20, 16, 6, 6)
         elif self._shape == "diamond":
             painter.drawPolygon(
                 QPolygonF(
@@ -107,6 +155,29 @@ class LegendSwatch(QWidget):
             painter.drawEllipse(4, 4, 18, 18)
 
 
+class _BatchOptimizationWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, *, package, project_root: Path, config) -> None:
+        super().__init__()
+        self._package = package
+        self._project_root = project_root
+        self._config = config
+
+    def run(self) -> None:
+        try:
+            result = execute_optimization(
+                self._package,
+                project_root=self._project_root,
+                config=self._config,
+            )
+        except (OptimizationExecutionError, OSError, KeyError, ValueError) as error:
+            self.failed.emit(str(error))
+            return
+        self.finished.emit(result)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -116,6 +187,7 @@ class MainWindow(QMainWindow):
             ("dependency", "graph_mode.dependency"),
             ("subsystems", "graph_mode.subsystems"),
             ("tasks", "graph_mode.tasks"),
+            ("batches", "graph_mode.batches"),
         ]
         self.setWindowTitle(tr(self._language, "app.name"))
         self.resize(1480, 920)
@@ -126,6 +198,18 @@ class MainWindow(QMainWindow):
         self._task_graph = None
         self._optimize_plan = None
         self._translate_plan = None
+        self._optimize_batch = None
+        self._translate_batch = None
+        self._optimization_history_by_unit: dict[str, list] = {}
+        self._batch_run_report: BatchRunReport | None = None
+        self._batch_run_items = []
+        self._batch_run_item_index = 0
+        self._batch_run_status_by_unit: dict[str, BatchRunItemStatus] = {}
+        self._batch_run_current_unit_id: str | None = None
+        self._batch_run_stop_requested = False
+        self._batch_run_config = None
+        self._batch_run_thread: QThread | None = None
+        self._batch_run_worker: _BatchOptimizationWorker | None = None
         self._selected_node_id: str | None = None
         self._selected_task_unit_id: str | None = None
         self._current_project_path: Path | None = None
@@ -142,8 +226,10 @@ class MainWindow(QMainWindow):
         self._graph_view = DependencyGraphView()
         self._subsystem_view = SubsystemCanvasView()
         self._task_graph_view = TaskGraphView()
+        self._task_batch_view = TaskBatchView(language=self._language)
         self._detail_panel = DetailPanel(language=self._language)
         self._task_detail_panel = TaskDetailPanel(language=self._language)
+        self._batch_monitor_panel = BatchMonitorPanel(language=self._language)
         self._search_input = QLineEdit()
         self._focus_filter = QComboBox()
         self._neighbor_label = QLabel()
@@ -151,10 +237,48 @@ class MainWindow(QMainWindow):
         self._search_result_label = QLabel()
         self._next_match_button = QPushButton()
         self._reset_view_button = QPushButton()
+        self._export_image_button = QPushButton()
         self._graph_mode_buttons: dict[str, QPushButton] = {}
         self._canvas_stack = QStackedWidget()
         self._detail_stack = QStackedWidget()
         self._legend_labels: dict[str, QLabel] = {}
+        self._legend_items: dict[str, QWidget] = {}
+        self._legend_modes: dict[str, tuple[str, ...]] = {
+            "dependency": (
+                "legend.python_file",
+                "legend.leaf_file",
+                "legend.top_level_script",
+                "legend.external_package",
+                "legend.cycle_member",
+                "legend.isolated_file",
+            ),
+            "subsystems": (
+                "legend.python_file",
+                "legend.leaf_file",
+                "legend.top_level_script",
+                "legend.external_package",
+                "legend.cycle_member",
+                "legend.isolated_file",
+            ),
+            "tasks": (
+                "legend.task_function",
+                "legend.task_class_group",
+                "legend.task_script_block",
+                "legend.task_cycle_group",
+                "legend.task_edge_strong",
+                "legend.task_edge_inheritance",
+                "legend.task_edge_context",
+            ),
+            "batches": (
+                "legend.task_function",
+                "legend.task_class_group",
+                "legend.task_script_block",
+                "legend.task_cycle_group",
+                "legend.task_edge_strong",
+                "legend.task_edge_inheritance",
+                "legend.task_edge_context",
+            ),
+        }
         self._splitter: QSplitter | None = None
 
         self._graph_view.node_selected.connect(self._handle_node_selected)
@@ -165,13 +289,23 @@ class MainWindow(QMainWindow):
         self._subsystem_view.background_clicked.connect(self._handle_graph_background_clicked)
         self._task_graph_view.unit_selected.connect(self._handle_task_unit_selected)
         self._task_graph_view.background_clicked.connect(self._handle_graph_background_clicked)
-        self._task_detail_panel.export_requested.connect(self._export_task_unit_package)
+        self._task_batch_view.unit_selected.connect(self._handle_task_unit_selected)
+        self._task_batch_view.background_clicked.connect(self._handle_graph_background_clicked)
+        self._task_batch_view.run_phase_requested.connect(self._handle_task_batch_run_phase)
+        self._task_batch_view.run_batch_requested.connect(self._handle_task_batch_run_all)
+        self._task_batch_view.stop_requested.connect(self._handle_task_batch_stop)
+        self._task_batch_view.mode_changed.connect(lambda _mode: self._refresh_batch_monitor_panel())
+        self._task_detail_panel.assign_unit_requested.connect(self._handle_task_unit_assignment)
+        self._task_detail_panel.assign_phase_requested.connect(self._handle_task_phase_assignment)
+        self._task_detail_panel.optimization_history_requested.connect(self._open_saved_optimization_history)
+        self._batch_monitor_panel.optimization_history_requested.connect(self._open_saved_optimization_history)
         self._language_selector.currentIndexChanged.connect(self._handle_language_changed)
 
         self._build_ui()
         self._apply_styles()
         self._set_graph_controls_enabled(False)
         self._apply_language()
+        self._task_detail_panel.set_view_mode("tasks")
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -230,12 +364,15 @@ class MainWindow(QMainWindow):
         self._next_match_button.clicked.connect(self._select_next_search_match)
         self._reset_view_button.setProperty("variant", "secondary")
         self._reset_view_button.clicked.connect(self._handle_reset_view)
+        self._export_image_button.setProperty("variant", "secondary")
+        self._export_image_button.clicked.connect(self._export_current_canvas_image)
         controls_layout.addWidget(self._search_input, stretch=1)
         controls_layout.addWidget(self._focus_filter)
         controls_layout.addWidget(self._neighbor_label)
         controls_layout.addWidget(self._neighbor_filter)
         controls_layout.addWidget(self._next_match_button)
         controls_layout.addWidget(self._reset_view_button)
+        controls_layout.addWidget(self._export_image_button)
         controls_layout.addWidget(self._search_result_label)
         graph_layout.addWidget(controls)
 
@@ -249,6 +386,7 @@ class MainWindow(QMainWindow):
         self._canvas_stack.addWidget(self._graph_view)
         self._canvas_stack.addWidget(self._subsystem_view)
         self._canvas_stack.addWidget(self._task_graph_view)
+        self._canvas_stack.addWidget(self._task_batch_view)
         canvas_layout.addWidget(self._canvas_stack, stretch=1)
         graph_layout.addWidget(canvas_frame, stretch=1)
 
@@ -259,6 +397,7 @@ class MainWindow(QMainWindow):
         detail_layout.setSpacing(12)
         self._detail_stack.addWidget(self._detail_panel)
         self._detail_stack.addWidget(self._task_detail_panel)
+        self._detail_stack.addWidget(self._batch_monitor_panel)
         detail_layout.addWidget(self._detail_stack)
 
         splitter.addWidget(graph_panel)
@@ -270,6 +409,21 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(splitter, stretch=1)
 
         self.setCentralWidget(root)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._batch_run_thread is not None:
+            QApplication.processEvents()
+            self._batch_run_thread.wait(50)
+            if self._batch_run_thread is not None and self._batch_run_thread.isRunning():
+                QMessageBox.information(
+                    self,
+                    tr(self._language, "batch_run.dialog.close_blocked_title"),
+                    tr(self._language, "batch_run.dialog.close_blocked_body"),
+                )
+                event.ignore()
+                return
+            self._cleanup_batch_worker()
+        super().closeEvent(event)
 
     def _build_legend(self) -> QFrame:
         frame = QFrame()
@@ -288,6 +442,13 @@ class MainWindow(QMainWindow):
                 "legend.isolated_file",
                 LegendSwatch(shape="circle", fill_color="#3559d1", outer_color="#a06dff", dashed_outer=True),
             ),
+            ("legend.task_function", LegendSwatch(shape="task_rect", fill_color="#3559d1")),
+            ("legend.task_class_group", LegendSwatch(shape="task_rect", fill_color="#118c6a")),
+            ("legend.task_script_block", LegendSwatch(shape="task_rect", fill_color="#d07a1f")),
+            ("legend.task_cycle_group", LegendSwatch(shape="task_rect", fill_color="#9b4fd8")),
+            ("legend.task_edge_strong", LegendSwatch(shape="edge_strong", fill_color="#6f8fff")),
+            ("legend.task_edge_inheritance", LegendSwatch(shape="edge_inherit", fill_color="#49d39b")),
+            ("legend.task_edge_context", LegendSwatch(shape="edge_context", fill_color="#8fa1bb")),
         ]
 
         for key, swatch in legend_items:
@@ -297,6 +458,7 @@ class MainWindow(QMainWindow):
             item_layout.setSpacing(6)
             label = QLabel()
             self._legend_labels[key] = label
+            self._legend_items[key] = item
             item_layout.addWidget(swatch)
             item_layout.addWidget(label)
             layout.addWidget(item)
@@ -493,6 +655,7 @@ class MainWindow(QMainWindow):
         self._refresh_button.setText(tr(self._language, "button.refresh"))
         self._next_match_button.setText(tr(self._language, "button.next_match"))
         self._reset_view_button.setText(tr(self._language, "button.reset_view"))
+        self._export_image_button.setText(tr(self._language, "button.export_image"))
         self._neighbor_label.setText(tr(self._language, "neighbor.label"))
         self._rebuild_graph_mode_buttons()
         for key, label in self._legend_labels.items():
@@ -500,14 +663,23 @@ class MainWindow(QMainWindow):
         self._search_input.setPlaceholderText(tr(self._language, "search.placeholder"))
         self._detail_panel.set_language(self._language)
         self._task_detail_panel.set_language(self._language)
+        self._batch_monitor_panel.set_language(self._language)
         self._graph_view.set_language(self._language)
         self._subsystem_view.set_language(self._language)
         self._task_graph_view.set_language(self._language)
+        self._task_batch_view.set_language(self._language)
+        self._refresh_batch_execution_views()
+        self._refresh_batch_monitor_panel()
         self._rebuild_language_selector()
         self._rebuild_focus_filter()
         self._rebuild_neighbor_filter()
         self._refresh_search_label()
         self._update_graph_mode_ui()
+
+    def _update_legend_ui(self) -> None:
+        active_keys = set(self._legend_modes.get(self._graph_mode, self._legend_modes["dependency"]))
+        for key, item in self._legend_items.items():
+            item.setVisible(key in active_keys)
 
     def _rebuild_language_selector(self) -> None:
         current_data = self._language_selector.currentData()
@@ -525,12 +697,21 @@ class MainWindow(QMainWindow):
         current_data = self._focus_filter.currentData() or "all"
         self._focus_filter.blockSignals(True)
         self._focus_filter.clear()
-        self._focus_filter.addItem(tr(self._language, "focus.all"), "all")
-        self._focus_filter.addItem(tr(self._language, "focus.internal"), "internal")
-        self._focus_filter.addItem(tr(self._language, "focus.leaf"), "leaf")
-        self._focus_filter.addItem(tr(self._language, "focus.external"), "external")
-        self._focus_filter.addItem(tr(self._language, "focus.cycle"), "cycle")
-        self._focus_filter.addItem(tr(self._language, "focus.isolated"), "isolated")
+        if self._graph_mode in {"tasks", "batches"}:
+            self._focus_filter.addItem(tr(self._language, "focus.task_all"), "task_all")
+            self._focus_filter.addItem(tr(self._language, "focus.task_function"), "task_function")
+            self._focus_filter.addItem(tr(self._language, "focus.task_class_group"), "task_class_group")
+            self._focus_filter.addItem(tr(self._language, "focus.task_script_block"), "task_script_block")
+            self._focus_filter.addItem(tr(self._language, "focus.task_cycle_group"), "task_cycle_group")
+            self._focus_filter.addItem(tr(self._language, "focus.task_ready"), "task_ready")
+            self._focus_filter.addItem(tr(self._language, "focus.task_blocked"), "task_blocked")
+        else:
+            self._focus_filter.addItem(tr(self._language, "focus.all"), "all")
+            self._focus_filter.addItem(tr(self._language, "focus.internal"), "internal")
+            self._focus_filter.addItem(tr(self._language, "focus.leaf"), "leaf")
+            self._focus_filter.addItem(tr(self._language, "focus.external"), "external")
+            self._focus_filter.addItem(tr(self._language, "focus.cycle"), "cycle")
+            self._focus_filter.addItem(tr(self._language, "focus.isolated"), "isolated")
         index = self._focus_filter.findData(current_data)
         self._focus_filter.setCurrentIndex(index if index >= 0 else 0)
         self._focus_filter.blockSignals(False)
@@ -548,6 +729,7 @@ class MainWindow(QMainWindow):
         self._graph_view.set_neighbor_depth(neighbor_depth)
         self._subsystem_view.set_neighbor_depth(neighbor_depth)
         self._task_graph_view.set_neighbor_depth(neighbor_depth)
+        self._task_batch_view.set_neighbor_depth(neighbor_depth)
 
     def _rebuild_graph_mode_buttons(self) -> None:
         for mode, translation_key in self._graph_modes:
@@ -593,7 +775,23 @@ class MainWindow(QMainWindow):
             return
         save_model_config(dialog.model_config())
 
+    def _resolve_model_config(self, *, interactive: bool) -> object | None:
+        current = load_model_config()
+        if current.api_token and current.api_url and current.model_name:
+            return current
+        if not interactive:
+            return None
+        dialog = ModelConfigDialog(language=self._language, initial_config=current, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        config = dialog.model_config()
+        save_model_config(config)
+        return config
+
     def _load_project(self, project_path: Path) -> None:
+        if self._batch_run_report is None:
+            self._batch_run_status_by_unit = {}
+            self._batch_run_current_unit_id = None
         try:
             graph = self._analyzer.analyze(project_path)
         except Exception as error:  # pragma: no cover
@@ -605,6 +803,9 @@ class MainWindow(QMainWindow):
         self._task_graph = build_task_graph(graph)
         self._optimize_plan = build_task_execution_plan(graph, mode=TaskMode.OPTIMIZE)
         self._translate_plan = build_task_execution_plan(graph, mode=TaskMode.TRANSLATE)
+        self._optimize_batch = build_task_batch(graph, mode=TaskMode.OPTIMIZE)
+        self._translate_batch = build_task_batch(graph, mode=TaskMode.TRANSLATE)
+        self._optimization_history_by_unit = load_optimization_history(project_path)
         self._current_project_path = project_path
         self._graph_view.set_graph(graph, self._insights)
         self._graph_view.set_language(self._language)
@@ -612,6 +813,14 @@ class MainWindow(QMainWindow):
         self._subsystem_view.set_language(self._language)
         self._task_graph_view.set_task_graph(self._task_graph)
         self._task_graph_view.set_language(self._language)
+        self._task_batch_view.set_batches(
+            task_graph=self._task_graph,
+            optimize_batch=self._optimize_batch,
+            translate_batch=self._translate_batch,
+        )
+        self._task_batch_view.set_language(self._language)
+        self._refresh_batch_execution_views()
+        self._refresh_batch_monitor_panel()
         self._set_graph_controls_enabled(True)
         self._handle_node_selected(None)
         self._handle_task_unit_selected(None)
@@ -632,20 +841,31 @@ class MainWindow(QMainWindow):
     def _handle_task_unit_selected(self, unit_id: str | None) -> None:
         self._selected_task_unit_id = unit_id
         self._task_graph_view.select_unit(unit_id)
+        self._task_batch_view.select_unit(unit_id)
+        if self._graph_mode == "batches":
+            self._refresh_batch_monitor_panel()
+            return
         if self._task_graph is None or unit_id is None:
             self._task_detail_panel.clear_panel()
             return
 
         unit = next((candidate for candidate in self._task_graph.units if candidate.id == unit_id), None)
         self._task_detail_panel.set_selection(
+            project_graph=self._graph,
             task_graph=self._task_graph,
             optimize_plan=self._optimize_plan,
             translate_plan=self._translate_plan,
+            optimize_batch=self._optimize_batch,
+            translate_batch=self._translate_batch,
+            optimization_history_by_unit=self._optimization_history_by_unit,
+            batch_run_report=self._batch_run_report,
+            batch_run_status_by_unit=self._batch_run_status_by_unit,
+            batch_run_current_unit_id=self._batch_run_current_unit_id,
             unit=unit,
         )
 
     def _handle_graph_background_clicked(self) -> None:
-        if self._graph_mode == "tasks":
+        if self._graph_mode in {"tasks", "batches"}:
             self._handle_task_unit_selected(None)
             return
         self._handle_node_selected(None)
@@ -683,11 +903,13 @@ class MainWindow(QMainWindow):
         self._graph_view.set_neighbor_depth(neighbor_depth)
         self._subsystem_view.set_neighbor_depth(neighbor_depth)
         self._task_graph_view.set_neighbor_depth(neighbor_depth)
+        self._task_batch_view.set_neighbor_depth(neighbor_depth)
 
     def _set_graph_mode(self, mode: str) -> None:
         if mode not in self._graph_mode_buttons:
             return
         self._graph_mode = mode
+        self._rebuild_focus_filter()
         self._update_graph_mode_ui()
 
     def _update_graph_mode_ui(self) -> None:
@@ -696,16 +918,22 @@ class MainWindow(QMainWindow):
             button.setChecked(mode == self._graph_mode)
             button.setEnabled(has_graph)
         self._reset_view_button.setEnabled(has_graph)
+        self._export_image_button.setEnabled(has_graph)
         if self._graph_mode == "subsystems":
             self._canvas_stack.setCurrentWidget(self._subsystem_view)
             self._detail_stack.setCurrentWidget(self._detail_panel)
         elif self._graph_mode == "tasks":
             self._canvas_stack.setCurrentWidget(self._task_graph_view)
             self._detail_stack.setCurrentWidget(self._task_detail_panel)
+            self._task_detail_panel.set_view_mode("tasks")
+        elif self._graph_mode == "batches":
+            self._canvas_stack.setCurrentWidget(self._task_batch_view)
+            self._detail_stack.setCurrentWidget(self._batch_monitor_panel)
+            self._refresh_batch_monitor_panel()
         else:
             self._canvas_stack.setCurrentWidget(self._graph_view)
             self._detail_stack.setCurrentWidget(self._detail_panel)
-        if self._graph_mode == "tasks":
+        if self._graph_mode in {"tasks", "batches"}:
             if self._selected_task_unit_id is None:
                 self._task_detail_panel.clear_panel()
             else:
@@ -715,18 +943,20 @@ class MainWindow(QMainWindow):
                 self._detail_panel.clear_panel()
             else:
                 self._handle_node_selected(self._selected_node_id)
+        self._apply_focus_and_search(auto_select=False)
+        self._update_legend_ui()
         self._update_dependency_controls()
 
     def _update_dependency_controls(self) -> None:
         has_graph = self._graph is not None
-        dependency_mode = self._graph_mode == "dependency"
-        dependency_controls_enabled = has_graph and dependency_mode
-        self._search_input.setEnabled(dependency_controls_enabled)
-        self._focus_filter.setEnabled(dependency_controls_enabled)
-        self._neighbor_filter.setEnabled(has_graph)
-        self._neighbor_label.setEnabled(has_graph)
-        self._next_match_button.setEnabled(dependency_controls_enabled and bool(self._search_matches))
-        self._search_result_label.setEnabled(dependency_controls_enabled)
+        search_controls_enabled = has_graph
+        neighbor_enabled = has_graph and self._graph_mode in {"dependency", "subsystems", "tasks"}
+        self._search_input.setEnabled(search_controls_enabled)
+        self._focus_filter.setEnabled(search_controls_enabled)
+        self._neighbor_filter.setEnabled(neighbor_enabled)
+        self._neighbor_label.setEnabled(neighbor_enabled)
+        self._next_match_button.setEnabled(search_controls_enabled and bool(self._search_matches))
+        self._search_result_label.setEnabled(search_controls_enabled)
 
     def _handle_reset_view(self) -> None:
         if self._graph_mode == "subsystems":
@@ -735,21 +965,82 @@ class MainWindow(QMainWindow):
         if self._graph_mode == "tasks":
             self._task_graph_view.reset_view()
             return
+        if self._graph_mode == "batches":
+            self._task_batch_view.reset_view()
+            return
         self._graph_view.reset_view()
 
-    def _apply_focus_and_search(self, *, auto_select: bool) -> None:
-        if self._graph is None or self._insights is None:
+    def _export_current_canvas_image(self) -> None:
+        if self._current_project_path is None or self._graph is None:
             return
 
-        focused_node_ids = self._focused_node_ids()
-        self._graph_view.set_focused_node_ids(focused_node_ids)
+        default_name = f"{self._graph_mode}.png"
+        file_name, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            tr(self._language, "image_export.dialog.title"),
+            str(self._current_project_path / default_name),
+            tr(self._language, "image_export.dialog.filter"),
+        )
+        if not file_name:
+            return
 
-        if auto_select and focused_node_ids is not None and self._selected_node_id not in focused_node_ids:
-            fallback_node_id = self._preferred_node_id(focused_node_ids)
-            self._handle_node_selected(fallback_node_id)
-        elif self._selected_node_id is None and auto_select:
-            fallback_node_id = self._preferred_node_id(focused_node_ids)
-            self._handle_node_selected(fallback_node_id)
+        output_path = Path(file_name)
+        if output_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".svg"}:
+            if "svg" in selected_filter.lower():
+                output_path = output_path.with_suffix(".svg")
+            elif "jpg" in selected_filter.lower() or "jpeg" in selected_filter.lower():
+                output_path = output_path.with_suffix(".jpg")
+            else:
+                output_path = output_path.with_suffix(".png")
+
+        try:
+            if self._graph_mode == "subsystems":
+                self._subsystem_view.export_image(str(output_path))
+            elif self._graph_mode == "tasks":
+                self._task_graph_view.export_image(str(output_path))
+            elif self._graph_mode == "batches":
+                self._task_batch_view.export_image(str(output_path))
+            else:
+                self._graph_view.export_image(str(output_path))
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "image_export.dialog.error_title"),
+                tr(self._language, "image_export.dialog.error_body", error=str(error)),
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            tr(self._language, "image_export.dialog.success_title"),
+            tr(self._language, "image_export.dialog.success_body", path=str(output_path)),
+        )
+
+    def _apply_focus_and_search(self, *, auto_select: bool) -> None:
+        if self._graph is None:
+            return
+
+        if self._graph_mode in {"tasks", "batches"}:
+            focused_unit_ids = self._focused_task_unit_ids()
+            self._task_graph_view.set_focused_unit_ids(focused_unit_ids)
+            self._task_batch_view.set_focused_unit_ids(focused_unit_ids)
+            if auto_select and focused_unit_ids is not None and self._selected_task_unit_id not in focused_unit_ids:
+                fallback_unit_id = self._preferred_task_unit_id(focused_unit_ids)
+                self._handle_task_unit_selected(fallback_unit_id)
+            elif self._selected_task_unit_id is None and auto_select:
+                fallback_unit_id = self._preferred_task_unit_id(focused_unit_ids)
+                self._handle_task_unit_selected(fallback_unit_id)
+        else:
+            focused_node_ids = self._focused_node_ids()
+            self._graph_view.set_focused_node_ids(focused_node_ids)
+            self._subsystem_view.set_focused_node_ids(focused_node_ids)
+
+            if auto_select and focused_node_ids is not None and self._selected_node_id not in focused_node_ids:
+                fallback_node_id = self._preferred_node_id(focused_node_ids)
+                self._handle_node_selected(fallback_node_id)
+            elif self._selected_node_id is None and auto_select:
+                fallback_node_id = self._preferred_node_id(focused_node_ids)
+                self._handle_node_selected(fallback_node_id)
 
         self._refresh_search_matches(auto_select=auto_select)
 
@@ -759,31 +1050,56 @@ class MainWindow(QMainWindow):
             self._search_match_index = -1
             self._next_match_button.setEnabled(False)
             self._graph_view.set_search_match_node_ids(set())
+            self._subsystem_view.set_search_match_node_ids(set())
+            self._task_graph_view.set_search_match_unit_ids(set())
+            self._task_batch_view.set_search_match_unit_ids(set())
             self._refresh_search_label()
             return
 
         query = self._search_input.text().strip().lower()
-        visible_node_ids = self._focused_node_ids()
-        candidate_nodes = [
-            node
-            for node in self._graph.nodes
-            if visible_node_ids is None or node.id in visible_node_ids
-        ]
-
         if not query:
             self._search_matches = []
             self._search_match_index = -1
             self._next_match_button.setEnabled(False)
             self._graph_view.set_search_match_node_ids(set())
+            self._subsystem_view.set_search_match_node_ids(set())
+            self._task_graph_view.set_search_match_unit_ids(set())
+            self._task_batch_view.set_search_match_unit_ids(set())
             self._refresh_search_label()
             return
 
-        self._search_matches = [
-            node.id
-            for node in candidate_nodes
-            if self._node_matches_query(node, query)
-        ]
-        self._graph_view.set_search_match_node_ids(set(self._search_matches))
+        if self._graph_mode in {"tasks", "batches"}:
+            visible_unit_ids = self._focused_task_unit_ids()
+            candidate_units = [
+                unit
+                for unit in (self._task_graph.units if self._task_graph is not None else [])
+                if visible_unit_ids is None or unit.id in visible_unit_ids
+            ]
+            self._search_matches = [
+                unit.id
+                for unit in candidate_units
+                if self._task_unit_matches_query(unit, query)
+            ]
+            self._task_graph_view.set_search_match_unit_ids(set(self._search_matches))
+            self._task_batch_view.set_search_match_unit_ids(set(self._search_matches))
+            self._graph_view.set_search_match_node_ids(set())
+            self._subsystem_view.set_search_match_node_ids(set())
+        else:
+            visible_node_ids = self._focused_node_ids()
+            candidate_nodes = [
+                node
+                for node in self._graph.nodes
+                if visible_node_ids is None or node.id in visible_node_ids
+            ]
+            self._search_matches = [
+                node.id
+                for node in candidate_nodes
+                if self._node_matches_query(node, query)
+            ]
+            self._graph_view.set_search_match_node_ids(set(self._search_matches))
+            self._subsystem_view.set_search_match_node_ids(set(self._search_matches))
+            self._task_graph_view.set_search_match_unit_ids(set())
+            self._task_batch_view.set_search_match_unit_ids(set())
         self._next_match_button.setEnabled(bool(self._search_matches))
         self._refresh_search_label()
 
@@ -791,20 +1107,30 @@ class MainWindow(QMainWindow):
             self._search_match_index = -1
             return
 
-        if self._selected_node_id in self._search_matches:
-            self._search_match_index = self._search_matches.index(self._selected_node_id)
+        current_selected = self._selected_task_unit_id if self._graph_mode in {"tasks", "batches"} else self._selected_node_id
+        if current_selected in self._search_matches:
+            self._search_match_index = self._search_matches.index(current_selected)
             if auto_select:
-                self._handle_node_selected(self._selected_node_id)
+                if self._graph_mode in {"tasks", "batches"}:
+                    self._handle_task_unit_selected(current_selected)
+                else:
+                    self._handle_node_selected(current_selected)
             return
 
         self._search_match_index = 0
         if auto_select:
-            self._handle_node_selected(self._search_matches[0])
+            if self._graph_mode in {"tasks", "batches"}:
+                self._handle_task_unit_selected(self._search_matches[0])
+            else:
+                self._handle_node_selected(self._search_matches[0])
 
     def _select_next_search_match(self) -> None:
         if not self._search_matches:
             return
         self._search_match_index = (self._search_match_index + 1) % len(self._search_matches)
+        if self._graph_mode in {"tasks", "batches"}:
+            self._handle_task_unit_selected(self._search_matches[self._search_match_index])
+            return
         self._handle_node_selected(self._search_matches[self._search_match_index])
 
     def _focused_node_ids(self) -> set[str] | None:
@@ -826,6 +1152,26 @@ class MainWindow(QMainWindow):
             return set(self._insights.isolated_node_ids)
         return None
 
+    def _focused_task_unit_ids(self) -> set[str] | None:
+        if self._task_graph is None:
+            return None
+        filter_key = self._focus_filter.currentData()
+        if filter_key in {None, "task_all"}:
+            return None
+        if filter_key == "task_function":
+            return {unit.id for unit in self._task_graph.units if unit.kind.value == "function"}
+        if filter_key == "task_class_group":
+            return {unit.id for unit in self._task_graph.units if unit.kind.value == "class_group"}
+        if filter_key == "task_script_block":
+            return {unit.id for unit in self._task_graph.units if unit.kind.value == "script_block"}
+        if filter_key == "task_cycle_group":
+            return {unit.id for unit in self._task_graph.units if unit.kind.value == "cycle_group"}
+        if filter_key == "task_ready":
+            return {unit.id for unit in self._task_graph.units if unit.ready_to_run}
+        if filter_key == "task_blocked":
+            return {unit.id for unit in self._task_graph.units if not unit.ready_to_run}
+        return None
+
     def _preferred_node_id(self, allowed_node_ids: set[str] | None) -> str | None:
         if self._graph is None:
             return None
@@ -838,9 +1184,327 @@ class MainWindow(QMainWindow):
         preferred = next((node for node in candidates if node.kind is not NodeKind.EXTERNAL_PACKAGE), None)
         return preferred.id if preferred else (candidates[0].id if candidates else None)
 
+    def _preferred_task_unit_id(self, allowed_unit_ids: set[str] | None) -> str | None:
+        if self._task_graph is None:
+            return None
+        candidates = [
+            unit
+            for unit in self._task_graph.units
+            if allowed_unit_ids is None or unit.id in allowed_unit_ids
+        ]
+        preferred = next((unit for unit in candidates if unit.kind.value == "function"), None)
+        return preferred.id if preferred else (candidates[0].id if candidates else None)
+
     def _node_matches_query(self, node: GraphNode, query: str) -> bool:
         haystacks = [node.label, node.path or "", node.module or ""]
         return any(query in haystack.lower() for haystack in haystacks)
+
+    def _task_unit_matches_query(self, unit, query: str) -> bool:
+        if self._graph is None:
+            return False
+        node_lookup = {node.id: node for node in self._graph.nodes}
+        haystacks = [unit.label]
+        for node_id in unit.node_ids:
+            node = node_lookup.get(node_id)
+            if node is None:
+                continue
+            haystacks.extend([node.label, node.path or "", node.module or ""])
+        return any(query in haystack.lower() for haystack in haystacks)
+
+    def _handle_task_unit_assignment(self, unit_id: str, mode_value: str) -> None:
+        if mode_value == TaskMode.OPTIMIZE.value:
+            self._run_task_unit_optimization(unit_id)
+            return
+        self._export_task_unit_package(unit_id, mode_value)
+
+    def _handle_task_phase_assignment(self, unit_id: str, mode_value: str) -> None:
+        self._export_task_batch_phase_for_unit(unit_id, mode_value)
+
+    def _handle_task_batch_run_phase(self, mode_value: str) -> None:
+        if mode_value != TaskMode.OPTIMIZE.value:
+            QMessageBox.information(
+                self,
+                tr(self._language, "batch_run.dialog.unsupported_title"),
+                tr(self._language, "batch_run.dialog.optimize_only_body"),
+            )
+            return
+        phase_index = self._selected_phase_index_for_unit(self._selected_task_unit_id)
+        if phase_index is None:
+            QMessageBox.information(
+                self,
+                tr(self._language, "batch_run.dialog.select_phase_title"),
+                tr(self._language, "batch_run.dialog.select_phase_body"),
+            )
+            return
+        self._start_batch_optimization(scope="current_phase", selected_phase=phase_index)
+
+    def _handle_task_batch_run_all(self, mode_value: str) -> None:
+        if mode_value != TaskMode.OPTIMIZE.value:
+            QMessageBox.information(
+                self,
+                tr(self._language, "batch_run.dialog.unsupported_title"),
+                tr(self._language, "batch_run.dialog.optimize_only_body"),
+            )
+            return
+        self._start_batch_optimization(scope="full_batch", selected_phase=None)
+
+    def _handle_task_batch_stop(self) -> None:
+        if self._batch_run_report is None:
+            return
+        self._batch_run_stop_requested = True
+        self._refresh_batch_execution_views(
+            status_text=tr(self._language, "task_batch_view.execution.stop_requested"),
+            is_running=True,
+        )
+
+    def _start_batch_optimization(self, *, scope: str, selected_phase: int | None) -> None:
+        if self._batch_run_report is not None:
+            QMessageBox.information(
+                self,
+                tr(self._language, "batch_run.dialog.already_running_title"),
+                tr(self._language, "batch_run.dialog.already_running_body"),
+            )
+            return
+        if self._graph is None or self._current_project_path is None or self._optimize_batch is None:
+            return
+        try:
+            config = self._resolve_model_config(interactive=True)
+            if config is None:
+                return
+        except OptimizationConfigError as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task.dialog.optimize_error_title"),
+                tr(self._language, "task.dialog.optimize_error_body", error=str(error)),
+            )
+            return
+
+        batch_items = [
+            item
+            for item in self._optimize_batch.items
+            if selected_phase is None or item.phase_index == selected_phase
+        ]
+        batch_items = sorted(batch_items, key=lambda item: (item.phase_index, item.order_index))
+        if not batch_items:
+            return
+
+        self._batch_run_report = create_batch_run_report(
+            project_root=self._current_project_path,
+            mode=TaskMode.OPTIMIZE,
+            scope=scope,
+            selected_phase=selected_phase,
+            items=batch_items,
+        )
+        self._batch_run_items = batch_items
+        self._batch_run_item_index = 0
+        self._batch_run_status_by_unit = {item.unit_id: BatchRunItemStatus.PENDING for item in batch_items}
+        self._batch_run_current_unit_id = None
+        self._batch_run_stop_requested = False
+        self._batch_run_config = config
+        self._refresh_batch_execution_views(
+            status_text=tr(
+                self._language,
+                "task_batch_view.execution.preparing",
+                count=len(batch_items),
+            ),
+            is_running=True,
+        )
+        QTimer.singleShot(0, self._run_next_batch_optimization_item)
+
+    def _run_next_batch_optimization_item(self) -> None:
+        if self._batch_run_report is None or self._graph is None or self._current_project_path is None:
+            return
+        if self._batch_run_stop_requested:
+            self._block_remaining_batch_items(
+                reason=tr(self._language, "batch_run.stop.blocked_reason"),
+            )
+            self._finish_batch_run(BatchRunStatus.STOPPED)
+            return
+        if self._batch_run_item_index >= len(self._batch_run_items):
+            self._finish_batch_run(BatchRunStatus.PASSED)
+            return
+
+        batch_item = self._batch_run_items[self._batch_run_item_index]
+        report_item = self._batch_run_report.items[self._batch_run_item_index]
+        report_item.status = BatchRunItemStatus.RUNNING
+        report_item.started_at_ms = self._now_ms()
+        self._batch_run_current_unit_id = batch_item.unit_id
+        self._batch_run_status_by_unit[batch_item.unit_id] = BatchRunItemStatus.RUNNING
+        write_batch_run_report(self._batch_run_report)
+        self._handle_task_unit_selected(batch_item.unit_id)
+        self._refresh_batch_execution_views(
+            status_text=tr(
+                self._language,
+                "task_batch_view.execution.running",
+                label=batch_item.label,
+                phase=batch_item.phase_index,
+            ),
+            is_running=True,
+        )
+        QApplication.processEvents()
+
+        package = build_task_unit_package(self._graph, unit_id=batch_item.unit_id, mode=TaskMode.OPTIMIZE)
+        self._start_batch_worker(package)
+
+    def _start_batch_worker(self, package) -> None:
+        if self._current_project_path is None or self._batch_run_config is None:
+            return
+        self._batch_run_thread = QThread(self)
+        self._batch_run_worker = _BatchOptimizationWorker(
+            package=package,
+            project_root=self._current_project_path,
+            config=self._batch_run_config,
+        )
+        self._batch_run_worker.moveToThread(self._batch_run_thread)
+        self._batch_run_thread.started.connect(self._batch_run_worker.run)
+        self._batch_run_worker.finished.connect(self._handle_batch_worker_finished)
+        self._batch_run_worker.failed.connect(self._handle_batch_worker_failed)
+        self._batch_run_worker.finished.connect(self._batch_run_thread.quit)
+        self._batch_run_worker.failed.connect(self._batch_run_thread.quit)
+        self._batch_run_thread.finished.connect(self._cleanup_batch_worker)
+        self._batch_run_thread.start()
+
+    def _handle_batch_worker_finished(self, result) -> None:
+        if self._batch_run_report is None or self._current_project_path is None:
+            return
+        batch_item = self._batch_run_items[self._batch_run_item_index]
+        report_item = self._batch_run_report.items[self._batch_run_item_index]
+        report_item.output_dir = result.output_dir
+        report_item.summary = result.summary
+        report_item.validation_status = result.validation_report.status.value
+        report_item.failure_category = result.failure_category.value if result.failure_category is not None else None
+        if result.status.value == "optimized" and result.validation_report.status.value == "passed":
+            report_item.status = BatchRunItemStatus.PASSED
+        else:
+            report_item.status = BatchRunItemStatus.BLOCKED
+        self._finalize_batch_run_item(batch_item.unit_id, report_item.status)
+
+    def _handle_batch_worker_failed(self, error: str) -> None:
+        if self._batch_run_report is None:
+            return
+        batch_item = self._batch_run_items[self._batch_run_item_index]
+        report_item = self._batch_run_report.items[self._batch_run_item_index]
+        report_item.status = BatchRunItemStatus.FAILED
+        report_item.error = error
+        self._finalize_batch_run_item(batch_item.unit_id, report_item.status)
+
+    def _finalize_batch_run_item(self, unit_id: str, status: BatchRunItemStatus) -> None:
+        if self._batch_run_report is None or self._current_project_path is None:
+            return
+        report_item = self._batch_run_report.items[self._batch_run_item_index]
+        report_item.finished_at_ms = self._now_ms()
+        self._batch_run_status_by_unit[unit_id] = status
+        write_batch_run_report(self._batch_run_report)
+        self._optimization_history_by_unit = load_optimization_history(self._current_project_path)
+        self._handle_task_unit_selected(unit_id)
+
+        self._batch_run_item_index += 1
+        if status is not BatchRunItemStatus.PASSED:
+            self._block_remaining_batch_items(
+                reason=tr(self._language, "batch_run.failure.blocked_reason"),
+            )
+            self._finish_batch_run(BatchRunStatus.FAILED)
+            return
+
+        QTimer.singleShot(0, self._run_next_batch_optimization_item)
+
+    def _cleanup_batch_worker(self) -> None:
+        if self._batch_run_worker is not None:
+            self._batch_run_worker.deleteLater()
+        if self._batch_run_thread is not None:
+            self._batch_run_thread.wait(1000)
+            self._batch_run_thread.deleteLater()
+        self._batch_run_worker = None
+        self._batch_run_thread = None
+
+    def _block_remaining_batch_items(self, *, reason: str) -> None:
+        if self._batch_run_report is None:
+            return
+        for report_item in self._batch_run_report.items[self._batch_run_item_index :]:
+            if report_item.status is not BatchRunItemStatus.PENDING:
+                continue
+            report_item.status = BatchRunItemStatus.BLOCKED
+            report_item.error = reason
+            report_item.finished_at_ms = self._now_ms()
+            self._batch_run_status_by_unit[report_item.unit_id] = BatchRunItemStatus.BLOCKED
+        write_batch_run_report(self._batch_run_report)
+
+    def _finish_batch_run(self, status: BatchRunStatus) -> None:
+        if self._batch_run_report is None:
+            return
+        self._batch_run_report.status = status
+        self._batch_run_report.finished_at_ms = self._now_ms()
+        write_batch_run_report(self._batch_run_report)
+        self._batch_run_current_unit_id = None
+        self._refresh_batch_execution_views(
+            status_text=self._batch_run_summary_text(self._batch_run_report),
+            is_running=False,
+        )
+        dialog = BatchRunReportDialog(language=self._language, report=self._batch_run_report, parent=self)
+        dialog.exec()
+        self._batch_run_report = None
+        self._batch_run_items = []
+        self._batch_run_item_index = 0
+        self._batch_run_stop_requested = False
+        self._batch_run_config = None
+
+    def _refresh_batch_execution_views(self, *, status_text: str | None = None, is_running: bool | None = None) -> None:
+        effective_running = self._batch_run_report is not None if is_running is None else is_running
+        text = status_text if status_text is not None else self._batch_run_summary_text(self._batch_run_report)
+        self._task_graph_view.set_execution_state(self._batch_run_status_by_unit)
+        self._task_batch_view.set_execution_state(
+            status_by_unit=self._batch_run_status_by_unit,
+            status_text=text,
+            is_running=effective_running,
+        )
+        self._refresh_batch_monitor_panel()
+
+    def _refresh_batch_monitor_panel(self) -> None:
+        mode = self._task_batch_view.current_mode()
+        batch = self._optimize_batch if mode is TaskMode.OPTIMIZE else self._translate_batch
+        report = self._batch_run_report if mode is TaskMode.OPTIMIZE else None
+        self._batch_monitor_panel.set_context(
+            task_graph=self._task_graph,
+            batch=batch,
+            report=report,
+            mode=mode,
+            current_running_unit_id=self._batch_run_current_unit_id,
+            optimization_history_by_unit=self._optimization_history_by_unit,
+        )
+
+    def _batch_run_summary_text(self, report: BatchRunReport | None) -> str:
+        if report is None:
+            return tr(self._language, "task_batch_view.execution.idle")
+        counts = {
+            BatchRunItemStatus.PENDING: 0,
+            BatchRunItemStatus.RUNNING: 0,
+            BatchRunItemStatus.PASSED: 0,
+            BatchRunItemStatus.FAILED: 0,
+            BatchRunItemStatus.BLOCKED: 0,
+        }
+        for item in report.items:
+            counts[item.status] += 1
+        return tr(
+            self._language,
+            "task_batch_view.execution.summary",
+            status=tr(self._language, f"batch_run.status.{report.status.value}"),
+            pending=counts[BatchRunItemStatus.PENDING],
+            running=counts[BatchRunItemStatus.RUNNING],
+            passed=counts[BatchRunItemStatus.PASSED],
+            failed=counts[BatchRunItemStatus.FAILED],
+            blocked=counts[BatchRunItemStatus.BLOCKED],
+        )
+
+    def _selected_phase_index_for_unit(self, unit_id: str | None) -> int | None:
+        if self._optimize_batch is None or unit_id is None:
+            return None
+        item = next((candidate for candidate in self._optimize_batch.items if candidate.unit_id == unit_id), None)
+        return item.phase_index if item is not None else None
+
+    def _now_ms(self) -> int:
+        from time import time
+
+        return int(time() * 1000)
 
     def _export_task_unit_package(self, unit_id: str, mode_value: str) -> None:
         if self._graph is None or self._current_project_path is None:
@@ -886,6 +1550,248 @@ class MainWindow(QMainWindow):
             self,
             tr(self._language, "task_package.dialog.export_success_title"),
             tr(self._language, "task_package.dialog.export_success_body", path=file_name),
+        )
+
+    def _run_task_unit_optimization(self, unit_id: str) -> None:
+        if self._graph is None or self._current_project_path is None:
+            return
+        try:
+            config = self._resolve_model_config(interactive=True)
+            if config is None:
+                return
+            package = build_task_unit_package(self._graph, unit_id=unit_id, mode=TaskMode.OPTIMIZE)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                result = execute_optimization(package, project_root=self._current_project_path, config=config)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except (OptimizationConfigError, OptimizationExecutionError, OSError) as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task.dialog.optimize_error_title"),
+                tr(self._language, "task.dialog.optimize_error_body", error=str(error)),
+            )
+            return
+
+        diff_text = Path(result.diff_path).read_text(encoding="utf-8", errors="replace")
+        dialog = OptimizationReviewDialog(
+            language=self._language,
+            result=result,
+            diff_text=diff_text,
+            parent=self,
+        )
+        dialog.apply_requested.connect(lambda: self._apply_optimization_patch(dialog, result, unit_id))
+        dialog.rollback_requested.connect(lambda: self._rollback_optimization_patch(dialog, result, unit_id))
+        dialog.exec()
+
+    def _open_saved_optimization_history(self, unit_id: str, output_dir: str) -> None:
+        output_path = Path(output_dir)
+        try:
+            result = load_saved_optimization_result(output_path)
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task_history.dialog.open_error_title"),
+                tr(self._language, "task_history.dialog.open_error_body", error=str(error)),
+            )
+            return
+
+        diff_path = Path(result.diff_path)
+        diff_text = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.is_file() else ""
+        dialog = OptimizationReviewDialog(
+            language=self._language,
+            result=result,
+            diff_text=diff_text,
+            parent=self,
+        )
+        apply_result = load_saved_apply_result(output_path)
+        rollback_result = load_saved_rollback_result(output_path)
+        if apply_result is not None and rollback_result is None:
+            dialog.set_applied_result(apply_result)
+        elif rollback_result is not None:
+            dialog.set_rollback_result(rollback_result)
+        dialog.apply_requested.connect(lambda: self._apply_optimization_patch(dialog, result, unit_id))
+        dialog.rollback_requested.connect(lambda: self._rollback_optimization_patch(dialog, result, unit_id))
+        dialog.exec()
+
+    def _apply_optimization_patch(
+        self,
+        dialog: OptimizationReviewDialog,
+        result,
+        unit_id: str,
+    ) -> None:
+        if self._current_project_path is None:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                apply_result = apply_optimization_result(result, project_root=self._current_project_path)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except OptimizationExecutionError as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "optimize_apply.error_title"),
+                tr(self._language, "optimize_apply.error_body", error=str(error)),
+            )
+            return
+
+        dialog.set_applied_result(apply_result)
+        self._reload_project_after_workspace_change(unit_id)
+        QMessageBox.information(
+            self,
+            tr(self._language, "optimize_apply.success_title"),
+            tr(
+                self._language,
+                "optimize_apply.success_body",
+                status=apply_result.validation_report.status.value,
+            ),
+        )
+
+    def _rollback_optimization_patch(
+        self,
+        dialog: OptimizationReviewDialog,
+        result,
+        unit_id: str,
+    ) -> None:
+        if self._current_project_path is None:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                rollback_result = rollback_optimization_result(result, project_root=self._current_project_path)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except OptimizationExecutionError as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "optimize_rollback.error_title"),
+                tr(self._language, "optimize_rollback.error_body", error=str(error)),
+            )
+            return
+
+        dialog.set_rollback_result(rollback_result)
+        self._reload_project_after_workspace_change(unit_id)
+        QMessageBox.information(
+            self,
+            tr(self._language, "optimize_rollback.success_title"),
+            tr(
+                self._language,
+                "optimize_rollback.success_body",
+                status=rollback_result.validation_report.status.value,
+            ),
+        )
+
+    def _reload_project_after_workspace_change(self, unit_id: str) -> None:
+        if self._current_project_path is None:
+            return
+        self._load_project(self._current_project_path)
+        if self._graph_mode in {"tasks", "batches"}:
+            if self._task_graph is None:
+                return
+            if any(unit.id == unit_id for unit in self._task_graph.units):
+                self._handle_task_unit_selected(unit_id)
+
+    def _export_task_batch(self, mode_value: str) -> None:
+        if self._current_project_path is None:
+            return
+        try:
+            mode = TaskMode(mode_value)
+            batch = self._optimize_batch if mode is TaskMode.OPTIMIZE else self._translate_batch
+            if batch is None:
+                raise ValueError("Task batch is not available")
+        except Exception as error:  # pragma: no cover
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task_batch.dialog.export_error_title"),
+                tr(self._language, "task_batch.dialog.export_error_body", error=str(error)),
+            )
+            return
+
+        file_name, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            tr(self._language, "task_batch.dialog.export_title"),
+            str(self._current_project_path / f"{mode.value}.task_batch.json"),
+            tr(self._language, "task_batch.dialog.export_filter"),
+        )
+        if not file_name:
+            return
+
+        try:
+            Path(file_name).write_text(
+                json.dumps(task_batch_to_dict(batch), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task_batch.dialog.export_error_title"),
+                tr(self._language, "task_batch.dialog.export_error_body", error=str(error)),
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            tr(self._language, "task_batch.dialog.export_success_title"),
+            tr(self._language, "task_batch.dialog.export_success_body", path=file_name),
+        )
+
+    def _export_task_batch_phase_for_unit(self, unit_id: str, mode_value: str) -> None:
+        if self._current_project_path is None:
+            return
+        try:
+            mode = TaskMode(mode_value)
+            batch = self._optimize_batch if mode is TaskMode.OPTIMIZE else self._translate_batch
+            if batch is None:
+                raise ValueError("Task batch is not available")
+            selected_item = next((item for item in batch.items if item.unit_id == unit_id), None)
+            if selected_item is None:
+                raise ValueError("Selected task unit is not available in the current batch")
+            phase_items = [item for item in batch.items if item.phase_index == selected_item.phase_index]
+            phase_batch = TaskBatch(
+                mode=mode,
+                items=phase_items,
+                phases=[
+                    TaskBatchPhase(
+                        index=selected_item.phase_index,
+                        item_ids=[item.id for item in phase_items],
+                    )
+                ],
+            )
+        except Exception as error:  # pragma: no cover
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task_batch.dialog.export_error_title"),
+                tr(self._language, "task_batch.dialog.export_error_body", error=str(error)),
+            )
+            return
+
+        file_name, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            tr(self._language, "task_batch.dialog.export_title"),
+            str(self._current_project_path / f"{mode.value}.phase_{selected_item.phase_index}.task_batch.json"),
+            tr(self._language, "task_batch.dialog.export_filter"),
+        )
+        if not file_name:
+            return
+
+        try:
+            Path(file_name).write_text(
+                json.dumps(task_batch_to_dict(phase_batch), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task_batch.dialog.export_error_title"),
+                tr(self._language, "task_batch.dialog.export_error_body", error=str(error)),
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            tr(self._language, "task_batch.dialog.export_success_title"),
+            tr(self._language, "task_batch.dialog.export_success_body", path=file_name),
         )
 
     def _set_graph_controls_enabled(self, enabled: bool) -> None:

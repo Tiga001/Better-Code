@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QGraphicsRectItem, QGraphicsTextItem
 
 from bettercode.models import GraphEdge, GraphNode, NodeKind, ProjectGraph, ProjectSummary
@@ -223,6 +224,38 @@ class SubsystemViewTests(unittest.TestCase):
             )
         ]
         self.assertEqual(reading_order, ["file:leaf.py", "file:core.py", "file:entry.py"])
+
+    def test_subsystem_node_selection_emits_on_release_not_press(self) -> None:
+        graph = ProjectGraph(
+            project=ProjectSummary(
+                name="demo",
+                root_path=Path("."),
+                python_files=1,
+                external_packages=0,
+                parse_duration_ms=0,
+                parse_errors=0,
+            ),
+            nodes=[
+                GraphNode(id="file:a.py", kind=NodeKind.PYTHON_FILE, label="a.py", path="a.py", module="a"),
+            ],
+            edges=[],
+            file_details={},
+        )
+        view = SubsystemCanvasView()
+        self.addCleanup(view.close)
+        view.resize(900, 640)
+        view.show()
+        view.set_graph(graph)
+        QApplication.processEvents()
+        hits: list[str] = []
+        view.node_selected.connect(hits.append)
+        center = view.mapFromScene(view._node_items["file:a.py"].scenePos())
+
+        QTest.mousePress(view.viewport(), Qt.LeftButton, Qt.NoModifier, center)
+        self.assertEqual(hits, [])
+
+        QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, center)
+        self.assertEqual(hits, ["file:a.py"])
 
 
 if __name__ == "__main__":

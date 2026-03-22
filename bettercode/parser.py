@@ -40,6 +40,7 @@ IGNORE_DIRS = {
     "__pycache__",
     "build",
     "dist",
+    "generated",
     "node_modules",
     "site-packages",
     "venv",
@@ -94,6 +95,8 @@ class _ProjectCallContext:
     raw_symbol_usages: list[_RawSymbolUsage]
     module_aliases: dict[str, str]
     symbol_aliases: dict[str, tuple[str, str]]
+    scoped_symbol_aliases: dict[str | None, dict[str, tuple[str, str]]]
+    star_import_modules: tuple[str, ...]
 
 
 class _ReturnCollector(ast.NodeVisitor):
@@ -119,10 +122,22 @@ class _CodeBlockExtractor(ast.NodeVisitor):
         self.calls: list[CodeBlockCall] = []
         self._stack: list[CodeBlockSummary] = []
         self._sequence = 0
+        self._module_scope_sequence = 0
         self._raw_calls: list[_RawCodeBlockCall] = []
         self._raw_instance_bindings: list[_RawInstanceBinding] = []
         self._raw_symbol_usages: list[_RawSymbolUsage] = []
         self._node_id = node_id
+
+    def visit_Module(self, node: ast.Module) -> None:  # type: ignore[override]
+        module_scope_group: list[ast.stmt] = []
+        for statement in node.body:
+            if self._is_module_scope_executable_statement(statement):
+                module_scope_group.append(statement)
+                continue
+            self._visit_module_scope_group(module_scope_group)
+            module_scope_group = []
+            self.visit(statement)
+        self._visit_module_scope_group(module_scope_group)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:  # type: ignore[override]
         block = self._push_block(
@@ -182,6 +197,25 @@ class _CodeBlockExtractor(ast.NodeVisitor):
             self.visit(child)
         self._pop_block(block.id)
 
+    def _visit_module_scope_group(self, statements: list[ast.stmt]) -> None:
+        if not statements:
+            return
+        self._module_scope_sequence += 1
+        first_statement = statements[0]
+        last_statement = statements[-1]
+        block = self._push_block(
+            kind=CodeBlockKind.MODULE_SCOPE,
+            name=f"module_scope_{self._module_scope_sequence}",
+            line=getattr(first_statement, "lineno", 1),
+            end_line=getattr(last_statement, "end_lineno", getattr(first_statement, "lineno", 1)),
+            signature=f"module scope #{self._module_scope_sequence}",
+            parameters=[],
+            return_summary=None,
+        )
+        for statement in statements:
+            self.visit(statement)
+        self._pop_block(block.id)
+
     def visit_Call(self, node: ast.Call) -> None:  # type: ignore[override]
         current_block = self._stack[-1] if self._stack else None
         self._raw_calls.append(
@@ -225,6 +259,7 @@ class _CodeBlockExtractor(ast.NodeVisitor):
                     import_module=node.module,
                     import_name=alias.name,
                     import_level=node.level,
+                    symbol_name=alias.asname or alias.name,
                 )
             )
         self.generic_visit(node)
@@ -256,6 +291,40 @@ class _CodeBlockExtractor(ast.NodeVisitor):
         self.blocks.append(block)
         self._stack.append(block)
         return block
+
+    def _is_module_scope_executable_statement(self, statement: ast.stmt) -> bool:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)):
+            return False
+        if isinstance(statement, ast.Expr):
+            return not self._is_simple_declarative_expression(statement.value)
+        if isinstance(statement, ast.Assign):
+            return not self._is_simple_declarative_expression(statement.value)
+        if isinstance(statement, ast.AnnAssign):
+            return statement.value is not None and not self._is_simple_declarative_expression(statement.value)
+        if isinstance(statement, ast.AugAssign):
+            return True
+        if isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Match)):
+            return True
+        if isinstance(statement, (ast.Assert, ast.Raise, ast.Delete)):
+            return True
+        return False
+
+    def _is_simple_declarative_expression(self, expression: ast.AST | None) -> bool:
+        if expression is None:
+            return True
+        if isinstance(expression, (ast.Constant, ast.Name)):
+            return True
+        if isinstance(expression, ast.Attribute):
+            return self._is_simple_declarative_expression(expression.value)
+        if isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
+            return all(self._is_simple_declarative_expression(element) for element in expression.elts)
+        if isinstance(expression, ast.Dict):
+            return all(
+                self._is_simple_declarative_expression(candidate)
+                for candidate in [*expression.keys, *expression.values]
+                if candidate is not None
+            )
+        return False
 
     def _pop_block(self, block_id: str) -> None:
         if self._stack and self._stack[-1].id == block_id:
@@ -386,7 +455,8 @@ class _CodeBlockExtractor(ast.NodeVisitor):
 
         for block in self.blocks:
             if block.parent_id is None:
-                top_level_by_name.setdefault(block.name, []).append(block.id)
+                if block.kind in {CodeBlockKind.CLASS, CodeBlockKind.FUNCTION}:
+                    top_level_by_name.setdefault(block.name, []).append(block.id)
             else:
                 child_blocks.setdefault(block.parent_id, []).append(block.id)
                 parent_block = blocks_by_id[block.parent_id]
@@ -569,6 +639,16 @@ class _CodeBlockExtractor(ast.NodeVisitor):
         blocks_by_id: dict[str, CodeBlockSummary],
     ) -> tuple[AgentTaskSuitability, list[str]]:
         reasons: list[str] = []
+
+        if block.kind is CodeBlockKind.MODULE_SCOPE:
+            reasons.append("module-scope execution usually needs file-level context")
+            if line_span > 80 or outgoing_count > 4 or child_count > 0:
+                reasons.append("module-scope block is large or fans out too widely")
+                return AgentTaskSuitability.AVOID, reasons
+            if incoming_count:
+                reasons.append(f"referenced by {incoming_count} block(s)")
+            reasons.append("script-style work can be handled, but keep surrounding setup visible")
+            return AgentTaskSuitability.CAUTION, reasons
 
         if block.kind is CodeBlockKind.CLASS:
             reasons.append(f"{child_count} direct child blocks")
@@ -861,8 +941,14 @@ class ProjectAnalyzer:
                 parsed_tree,
                 node_id=node_id,
             )
-            module_aliases, symbol_aliases = self._collect_import_bindings(
+            module_aliases, symbol_aliases, star_import_modules = self._collect_import_bindings(
                 parsed_tree=parsed_tree,
+                module_name=module_name,
+                file_path=file_path,
+                module_index=module_index,
+            )
+            scoped_symbol_aliases = self._collect_scoped_symbol_aliases(
+                raw_symbol_usages=raw_symbol_usages,
                 module_name=module_name,
                 file_path=file_path,
                 module_index=module_index,
@@ -877,6 +963,8 @@ class ProjectAnalyzer:
                 raw_symbol_usages=raw_symbol_usages,
                 module_aliases=module_aliases,
                 symbol_aliases=symbol_aliases,
+                scoped_symbol_aliases=scoped_symbol_aliases,
+                star_import_modules=star_import_modules,
             )
 
             for import_record in import_records:
@@ -1264,9 +1352,10 @@ class ProjectAnalyzer:
         module_name: str,
         file_path: Path,
         module_index: dict[str, Path],
-    ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
+    ) -> tuple[dict[str, str], dict[str, tuple[str, str]], tuple[str, ...]]:
         module_aliases: dict[str, str] = {}
         symbol_aliases: dict[str, tuple[str, str]] = {}
+        star_import_modules: list[str] = []
 
         for statement in parsed_tree.body:
             if isinstance(statement, ast.Import):
@@ -1293,6 +1382,8 @@ class ProjectAnalyzer:
 
             for alias in statement.names:
                 if alias.name == "*":
+                    if internal_base not in star_import_modules:
+                        star_import_modules.append(internal_base)
                     continue
                 local_name = alias.asname or alias.name
                 module_candidate = f"{base_module}.{alias.name}"
@@ -1301,7 +1392,39 @@ class ProjectAnalyzer:
                     continue
                 symbol_aliases[local_name] = (base_module, alias.name)
 
-        return module_aliases, symbol_aliases
+        return module_aliases, symbol_aliases, tuple(star_import_modules)
+
+    def _collect_scoped_symbol_aliases(
+        self,
+        *,
+        raw_symbol_usages: list[_RawSymbolUsage],
+        module_name: str,
+        file_path: Path,
+        module_index: dict[str, Path],
+    ) -> dict[str | None, dict[str, tuple[str, str]]]:
+        scoped_symbol_aliases: dict[str | None, dict[str, tuple[str, str]]] = {}
+        for raw_usage in raw_symbol_usages:
+            if raw_usage.import_name is None:
+                continue
+            local_name = raw_usage.symbol_name or raw_usage.import_name
+            if not local_name:
+                continue
+            base_module = self._resolve_relative_base(
+                module_name=raw_usage.import_module,
+                current_module=module_name,
+                file_path=file_path,
+                level=raw_usage.import_level,
+            )
+            if not base_module:
+                continue
+            internal_base = self._deepest_internal_candidate(base_module, module_index)
+            if internal_base is None:
+                continue
+            scoped_symbol_aliases.setdefault(raw_usage.owner_block_id, {})[local_name] = (
+                base_module,
+                raw_usage.import_name,
+            )
+        return scoped_symbol_aliases
 
     def _apply_cross_file_code_block_calls(
         self,
@@ -1320,7 +1443,7 @@ class ProjectAnalyzer:
             class_ids: dict[str, str] = {}
             blocks_by_id = {block.id: block for block in detail.code_blocks}
             for block in detail.code_blocks:
-                if block.parent_id is None:
+                if block.parent_id is None and block.kind is not CodeBlockKind.MODULE_SCOPE:
                     top_level_symbols[block.name] = block.id
                     if block.kind is CodeBlockKind.CLASS:
                         class_ids[block.name] = block.id
@@ -1402,7 +1525,7 @@ class ProjectAnalyzer:
             detail_blocks_by_id = {block.id: block for block in detail.code_blocks}
             for block in detail.code_blocks:
                 blocks_by_id[block.id] = block
-                if block.parent_id is None:
+                if block.parent_id is None and block.kind is not CodeBlockKind.MODULE_SCOPE:
                     top_level_symbols[block.name] = block.id
                     if block.kind is CodeBlockKind.CLASS:
                         class_ids[block.name] = block.id
@@ -1572,10 +1695,19 @@ class ProjectAnalyzer:
 
         if raw_usage.symbol_name is not None:
             binding = context.symbol_aliases.get(raw_usage.symbol_name)
+            if binding is None:
+                binding = context.scoped_symbol_aliases.get(raw_usage.owner_block_id, {}).get(raw_usage.symbol_name)
             if binding is not None:
                 target_module, target_symbol = binding
                 return module_top_level_symbols.get(target_module, {}).get(target_symbol)
-            return module_top_level_symbols.get(context.module_name, {}).get(raw_usage.symbol_name)
+            local_target = module_top_level_symbols.get(context.module_name, {}).get(raw_usage.symbol_name)
+            if local_target is not None:
+                return local_target
+            return self._resolve_star_imported_name_target(
+                local_name=raw_usage.symbol_name,
+                context=context,
+                module_top_level_symbols=module_top_level_symbols,
+            )
 
         return None
 
@@ -1596,11 +1728,17 @@ class ProjectAnalyzer:
             return module_top_level_symbols.get(module_name, {}).get(chain[-1])
 
         binding = context.symbol_aliases.get(root_name)
-        if binding is None:
+        if binding is not None:
+            target_module, target_symbol = binding
+            if len(chain) == 1:
+                return module_top_level_symbols.get(target_module, {}).get(target_symbol)
             return None
-        target_module, target_symbol = binding
         if len(chain) == 1:
-            return module_top_level_symbols.get(target_module, {}).get(target_symbol)
+            return self._resolve_star_imported_name_target(
+                local_name=root_name,
+                context=context,
+                module_top_level_symbols=module_top_level_symbols,
+            )
         return None
 
     def _known_internal_module(
@@ -1632,6 +1770,7 @@ class ProjectAnalyzer:
         if isinstance(func_node, ast.Name):
             imported_target = self._resolve_imported_name_target(
                 local_name=func_node.id,
+                owner_block_id=raw_call.source_id,
                 context=context,
                 module_top_level_symbols=module_top_level_symbols,
             )
@@ -1668,6 +1807,7 @@ class ProjectAnalyzer:
             if isinstance(func_node.value, ast.Call):
                 class_id = self._resolve_constructor_call_target(
                     constructor_func=func_node.value.func,
+                    owner_block_id=raw_call.source_id,
                     context=context,
                     module_top_level_symbols=module_top_level_symbols,
                     module_class_ids=module_class_ids,
@@ -1695,6 +1835,7 @@ class ProjectAnalyzer:
                 return local_target
             return self._resolve_imported_name_target(
                 local_name=func_node.id,
+                owner_block_id=None,
                 context=context,
                 module_top_level_symbols=module_top_level_symbols,
             )
@@ -1730,6 +1871,7 @@ class ProjectAnalyzer:
         if isinstance(func_node.value, ast.Call):
             class_id = self._resolve_constructor_call_target(
                 constructor_func=func_node.value.func,
+                owner_block_id=None,
                 context=context,
                 module_top_level_symbols=module_top_level_symbols,
                 module_class_ids=module_class_ids,
@@ -1743,14 +1885,21 @@ class ProjectAnalyzer:
         self,
         *,
         local_name: str,
+        owner_block_id: str | None,
         context: _ProjectCallContext,
         module_top_level_symbols: dict[str, dict[str, str]],
     ) -> str | None:
         binding = context.symbol_aliases.get(local_name)
         if binding is None:
-            return None
-        target_module, target_symbol = binding
-        return module_top_level_symbols.get(target_module, {}).get(target_symbol)
+            binding = context.scoped_symbol_aliases.get(owner_block_id, {}).get(local_name)
+        if binding is not None:
+            target_module, target_symbol = binding
+            return module_top_level_symbols.get(target_module, {}).get(target_symbol)
+        return self._resolve_star_imported_name_target(
+            local_name=local_name,
+            context=context,
+            module_top_level_symbols=module_top_level_symbols,
+        )
 
     def _resolve_attribute_chain_target(
         self,
@@ -1771,10 +1920,16 @@ class ProjectAnalyzer:
             return module_top_level_symbols.get(module_name, {}).get(chain[-1])
 
         symbol_binding = context.symbol_aliases.get(root_name)
-        if symbol_binding is None:
-            return None
-        target_module, target_symbol = symbol_binding
-        class_id = module_class_ids.get(target_module, {}).get(target_symbol)
+        if symbol_binding is not None:
+            target_module, target_symbol = symbol_binding
+            class_id = module_class_ids.get(target_module, {}).get(target_symbol)
+        else:
+            class_id = self._resolve_star_imported_class_id(
+                local_name=root_name,
+                context=context,
+                module_top_level_symbols=module_top_level_symbols,
+                module_class_ids=module_class_ids,
+            )
         if class_id is None:
             return None
         if len(chain) == 2:
@@ -1785,16 +1940,24 @@ class ProjectAnalyzer:
         self,
         *,
         constructor_func: ast.AST,
+        owner_block_id: str | None,
         context: _ProjectCallContext,
         module_top_level_symbols: dict[str, dict[str, str]],
         module_class_ids: dict[str, dict[str, str]],
     ) -> str | None:
         if isinstance(constructor_func, ast.Name):
             binding = context.symbol_aliases.get(constructor_func.id)
+            if binding is None:
+                binding = context.scoped_symbol_aliases.get(owner_block_id, {}).get(constructor_func.id)
             if binding is not None:
                 target_module, target_symbol = binding
                 return module_class_ids.get(target_module, {}).get(target_symbol)
-            return None
+            return self._resolve_star_imported_class_id(
+                local_name=constructor_func.id,
+                context=context,
+                module_top_level_symbols=module_top_level_symbols,
+                module_class_ids=module_class_ids,
+            )
 
         chain = self._attribute_chain(constructor_func)
         if not chain:
@@ -1807,6 +1970,42 @@ class ProjectAnalyzer:
         if len(chain) > 2:
             module_name = ".".join([base_module, *chain[1:-1]])
         return module_class_ids.get(module_name, {}).get(chain[-1])
+
+    def _resolve_star_imported_name_target(
+        self,
+        *,
+        local_name: str,
+        context: _ProjectCallContext,
+        module_top_level_symbols: dict[str, dict[str, str]],
+    ) -> str | None:
+        matches = {
+            module_top_level_symbols.get(module_name, {}).get(local_name)
+            for module_name in context.star_import_modules
+        }
+        matches.discard(None)
+        if len(matches) != 1:
+            return None
+        return next(iter(matches))
+
+    def _resolve_star_imported_class_id(
+        self,
+        *,
+        local_name: str,
+        context: _ProjectCallContext,
+        module_top_level_symbols: dict[str, dict[str, str]],
+        module_class_ids: dict[str, dict[str, str]],
+    ) -> str | None:
+        target_id = self._resolve_star_imported_name_target(
+            local_name=local_name,
+            context=context,
+            module_top_level_symbols=module_top_level_symbols,
+        )
+        if target_id is None:
+            return None
+        for class_ids in module_class_ids.values():
+            if class_ids.get(local_name) == target_id:
+                return target_id
+        return None
 
     def _bound_instance_class_target(
         self,
@@ -1825,6 +2024,7 @@ class ProjectAnalyzer:
                 continue
             latest_target = self._resolve_constructor_call_target(
                 constructor_func=binding.constructor_node,
+                owner_block_id=block_id,
                 context=context,
                 module_top_level_symbols=module_top_level_symbols,
                 module_class_ids=module_class_ids,
@@ -1888,6 +2088,16 @@ class ProjectAnalyzer:
         blocks_by_id: dict[str, CodeBlockSummary],
     ) -> tuple[AgentTaskSuitability, list[str]]:
         reasons: list[str] = []
+
+        if block.kind is CodeBlockKind.MODULE_SCOPE:
+            reasons.append("module-scope execution usually needs file-level context")
+            if line_span > 80 or outgoing_count > 4 or child_count > 0:
+                reasons.append("module-scope block is large or fans out too widely")
+                return AgentTaskSuitability.AVOID, reasons
+            if incoming_count:
+                reasons.append(f"referenced by {incoming_count} block(s)")
+            reasons.append("script-style work can be handled, but keep surrounding setup visible")
+            return AgentTaskSuitability.CAUTION, reasons
 
         if block.kind is CodeBlockKind.CLASS:
             reasons.append(f"{child_count} direct child blocks")

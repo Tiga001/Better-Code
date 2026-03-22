@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsObject, QGra
 from bettercode.graph_analysis import GraphInsights
 from bettercode.i18n import LanguageCode, tr
 from bettercode.models import GraphEdge, GraphNode, NodeKind, ProjectGraph
+from bettercode.ui.scene_export import export_scene_image
 
 
 GENERIC_FILENAMES = {"__init__.py", "main.py", "app.py"}
@@ -137,6 +138,7 @@ class GraphNodeItem(QGraphicsObject):
         self._cycle_member = False
         self._isolated = False
         self._neighbor_level = 0
+        self._press_pos: QPointF | None = None
         self._title_lines, self._subtitle = _node_display_text(node, duplicate_labels, language)
         self.setAcceptedMouseButtons(Qt.LeftButton)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
@@ -255,8 +257,17 @@ class GraphNodeItem(QGraphicsObject):
         self._draw_label(painter)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        self.clicked.emit(self.node.id)
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.pos()
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton and self._press_pos is not None:
+            drag_distance = (event.pos() - self._press_pos).manhattanLength()
+            if drag_distance < QApplication.startDragDistance() and self.boundingRect().contains(event.pos()):
+                self.clicked.emit(self.node.id)
+        self._press_pos = None
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
         self.double_clicked.emit(self.node.id)
@@ -718,3 +729,6 @@ class DependencyGraphView(QGraphicsView):
         self.resetTransform()
         self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
         self._min_scale = min(0.35, self.transform().m11())
+
+    def export_image(self, output_path: str) -> None:
+        export_scene_image(view=self, scene=self._scene, output_path=output_path)

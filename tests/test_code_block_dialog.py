@@ -9,6 +9,13 @@ from unittest.mock import patch
 
 from PySide6.QtWidgets import QApplication
 
+from bettercode.optimize_executor import (
+    OptimizationResult,
+    OptimizationStatus,
+    OptimizationValidationReport,
+    ValidationCommandResult,
+    ValidationStatus,
+)
 from bettercode.parser import ProjectAnalyzer
 from bettercode.translation_executor import ModelConfig, TranslationResult, TranslationStatus
 from bettercode.ui.code_block_dialog import CodeBlockDialog
@@ -179,6 +186,47 @@ class CodeBlockDialogTests(unittest.TestCase):
             self.assertEqual(dialog._inspector_stack.currentIndex(), 2)
             self.assertTrue(dialog._agent_notes_button.isChecked())
 
+    def test_renders_module_scope_block_in_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "helper.py").write_text(
+                textwrap.dedent(
+                    """
+                    def normalize(value: str) -> str:
+                        return value.strip()
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "demo.py").write_text(
+                textwrap.dedent(
+                    """
+                    from helper import normalize
+
+                    result = normalize(" ok ")
+                    print(result)
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            graph = ProjectAnalyzer().analyze(root)
+            node = next(candidate for candidate in graph.nodes if candidate.id == "file:demo.py")
+            detail = graph.file_details["file:demo.py"]
+            dialog = CodeBlockDialog(project_root=root, graph=graph, node=node, detail=detail)
+
+            self.assertEqual(dialog._tree.topLevelItemCount(), 1)
+            self.assertEqual(dialog._tree.topLevelItem(0).text(0), "module scope #1")
+            self.assertEqual(dialog._kind_chip.text(), "Script Block")
+            self.assertEqual(dialog._returns.text(), "Returns: n/a for script block")
+            task_items = [
+                dialog._agent_notes.item(index).text()
+                for index in range(dialog._agent_notes.count())
+            ]
+            self.assertTrue(any("Optimize" in item for item in task_items))
+            self.assertTrue(any("Translate" in item for item in task_items))
+
     def test_exports_selected_task_bundle_to_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -250,10 +298,81 @@ class CodeBlockDialogTests(unittest.TestCase):
             dialog._tree.setCurrentItem(dialog._tree.topLevelItem(0))
             dialog._agent_notes_button.click()
 
+            self.assertTrue(dialog._run_optimization_button.isEnabled())
             self.assertFalse(dialog._run_translation_button.isEnabled())
 
             dialog._agent_notes.setCurrentRow(1)
+            self.assertFalse(dialog._run_optimization_button.isEnabled())
             self.assertTrue(dialog._run_translation_button.isEnabled())
+
+    def test_runs_optimization_for_selected_optimize_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            output_dir = root / "generated" / "optimizations" / "service_run"
+            (root / "service.py").write_text(
+                textwrap.dedent(
+                    """
+                    def run(value: str) -> str:
+                        return value.strip()
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            graph = ProjectAnalyzer().analyze(root)
+            node = next(candidate for candidate in graph.nodes if candidate.id == "file:service.py")
+            detail = graph.file_details["file:service.py"]
+            dialog = CodeBlockDialog(project_root=root, graph=graph, node=node, detail=detail)
+            dialog._tree.setCurrentItem(dialog._tree.topLevelItem(0))
+            dialog._agent_notes_button.click()
+            dialog._agent_notes.setCurrentRow(0)
+
+            with (
+                patch.object(
+                    dialog,
+                    "_resolve_translation_config",
+                    return_value=ModelConfig(
+                        api_url="https://example.invalid/v1/chat/completions",
+                        api_token="token",
+                        model_name="model",
+                        timeout_seconds=30.0,
+                    ),
+                ),
+                patch(
+                    "bettercode.ui.code_block_dialog.execute_optimization",
+                    return_value=OptimizationResult(
+                        status=OptimizationStatus.OPTIMIZED,
+                        summary="done",
+                        assumptions=[],
+                        risks=[],
+                        validation_notes=[],
+                        suggested_tests=[],
+                        changed_files=[],
+                        original_files=[],
+                        raw_model_content="{}",
+                        output_dir=str(output_dir),
+                        diff_path=str(output_dir / "optimization.patch"),
+                        validation_report=OptimizationValidationReport(
+                            status=ValidationStatus.PASSED,
+                            workspace_dir=str(output_dir / "validation_workspace"),
+                            compile_command=ValidationCommandResult(
+                                command="python3 -m compileall .",
+                                returncode=0,
+                                stdout="",
+                                stderr="",
+                                ok=True,
+                            ),
+                            test_command=None,
+                            notes=[],
+                        ),
+                    ),
+                ) as execute_mock,
+                patch("bettercode.ui.code_block_dialog.QMessageBox.information") as information_mock,
+            ):
+                dialog._run_selected_optimization()
+
+            execute_mock.assert_called_once()
+            information_mock.assert_called_once()
 
     def test_runs_translation_for_selected_translate_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

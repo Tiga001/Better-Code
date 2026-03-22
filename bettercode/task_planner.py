@@ -18,6 +18,7 @@ from bettercode.models import (
     TaskBundle,
     TaskCandidate,
     TaskMode,
+    TaskTargetBlock,
 )
 
 
@@ -116,16 +117,27 @@ def build_task_bundle(graph: ProjectGraph, candidate: TaskCandidate) -> TaskBund
         for block_id in snippet_block_ids
         if block_id in block_lookup and block_id in owner_detail_by_block
     ]
+    target_blocks = [
+        _target_block(
+            project_root=graph.project.root_path,
+            file_detail=target_detail,
+            block=target_block,
+            source_cache=source_cache,
+        )
+    ]
 
     return TaskBundle(
         task=candidate,
         source_snippets=source_snippets,
         related_files=related_files,
         related_blocks=related_blocks,
+        target_blocks=target_blocks,
         usages=list(usages_by_target.get(candidate.target_block_id, [])),
         dependencies=list(target_detail.imports),
         constraints=list(candidate.constraints),
         acceptance_checks=list(candidate.acceptance_checks),
+        editable_files=[target_detail.path],
+        context_files=[path for path in related_files if path != target_detail.path],
     )
 
 
@@ -186,7 +198,10 @@ def _build_translate_candidate(
         mapping_status = DependencyMappingStatus.BLOCKED
         reasons.append("file currently has syntax errors, so translation cannot be validated safely")
 
-    if block.kind is not CodeBlockKind.FUNCTION or block.parent_id is not None:
+    if block.kind is CodeBlockKind.MODULE_SCOPE:
+        suitability = AgentTaskSuitability.AVOID
+        reasons.append("module-scope execution blocks are not part of the translation MVP yet")
+    elif block.kind is not CodeBlockKind.FUNCTION or block.parent_id is not None:
         suitability = AgentTaskSuitability.AVOID
         reasons.append("function-level translation MVP only supports top-level functions")
 
@@ -310,6 +325,47 @@ def _block_excerpt(
 
 def _block_label(block: CodeBlockSummary, file_detail: FileDetail) -> str:
     return f"{block.signature or block.name} [{file_detail.path}]"
+
+
+def _target_block(
+    *,
+    project_root: Path,
+    file_detail: FileDetail,
+    block: CodeBlockSummary,
+    source_cache: dict[Path, list[str]],
+) -> TaskTargetBlock:
+    return TaskTargetBlock(
+        id=block.id,
+        path=file_detail.path,
+        kind=block.kind,
+        name=block.name,
+        signature=block.signature,
+        start_line=block.line,
+        end_line=block.end_line,
+        source_text=_block_source_text(
+            project_root=project_root,
+            file_detail=file_detail,
+            block=block,
+            source_cache=source_cache,
+        ),
+    )
+
+
+def _block_source_text(
+    *,
+    project_root: Path,
+    file_detail: FileDetail,
+    block: CodeBlockSummary,
+    source_cache: dict[Path, list[str]],
+) -> str:
+    file_path = project_root / file_detail.path
+    if file_path not in source_cache:
+        try:
+            source_cache[file_path] = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            source_cache[file_path] = []
+    lines = source_cache[file_path]
+    return "\n".join(lines[max(block.line - 1, 0) : min(block.end_line, len(lines))])
 
 
 def _json_ready(value):

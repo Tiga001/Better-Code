@@ -43,6 +43,11 @@ from bettercode.models import (
     UsageConfidence,
     UsageKind,
 )
+from bettercode.optimize_executor import (
+    OptimizationConfigError,
+    OptimizationExecutionError,
+    execute_optimization,
+)
 from bettercode.task_planner import build_task_bundle, build_task_candidates, task_bundle_to_dict
 from bettercode.translation_executor import (
     ModelConfig,
@@ -146,6 +151,10 @@ class CodeBlockDialog(QDialog):
         self._run_translation_button.setObjectName("dialogActionButton")
         self._run_translation_button.clicked.connect(self._run_selected_translation)
         self._run_translation_button.setEnabled(False)
+        self._run_optimization_button = QPushButton()
+        self._run_optimization_button.setObjectName("dialogActionButton")
+        self._run_optimization_button.clicked.connect(self._run_selected_optimization)
+        self._run_optimization_button.setEnabled(False)
         self._configure_model_button = QPushButton()
         self._configure_model_button.setObjectName("dialogModeButton")
         self._configure_model_button.clicked.connect(self._open_model_config_dialog)
@@ -344,6 +353,7 @@ class CodeBlockDialog(QDialog):
         self._usages_button.setText(tr(self._language, "code_blocks.section.usages"))
         self._agent_notes_button.setText(tr(self._language, "code_blocks.section.agent_notes"))
         self._export_task_bundle_button.setText(tr(self._language, "task.button.export_bundle"))
+        self._run_optimization_button.setText(tr(self._language, "task.button.run_optimization"))
         self._run_translation_button.setText(tr(self._language, "task.button.run_translation"))
         self._configure_model_button.setText(tr(self._language, "task.button.configure_model"))
 
@@ -362,6 +372,7 @@ class CodeBlockDialog(QDialog):
             self._set_list_content(self._usages, [], tr(self._language, "code_blocks.placeholder.no_usages"))
             self._set_list_content(self._agent_notes, [], tr(self._language, "code_blocks.placeholder.no_agent_notes"))
             self._export_task_bundle_button.setEnabled(False)
+            self._run_optimization_button.setEnabled(False)
             self._run_translation_button.setEnabled(False)
             self._signature.setText(tr(self._language, "code_blocks.signature.value", signature="-"))
             self._lines.setText(tr(self._language, "code_blocks.lines.empty"))
@@ -480,6 +491,8 @@ class CodeBlockDialog(QDialog):
     def _kind_label(self, kind: CodeBlockKind) -> str:
         if kind is CodeBlockKind.CLASS:
             return tr(self._language, "code_blocks.kind.class")
+        if kind is CodeBlockKind.MODULE_SCOPE:
+            return tr(self._language, "code_blocks.kind.module_scope")
         if kind is CodeBlockKind.METHOD:
             return tr(self._language, "code_blocks.kind.method")
         return tr(self._language, "code_blocks.kind.function")
@@ -487,6 +500,8 @@ class CodeBlockDialog(QDialog):
     def _kind_tone(self, kind: CodeBlockKind) -> str:
         if kind is CodeBlockKind.CLASS:
             return "class"
+        if kind is CodeBlockKind.MODULE_SCOPE:
+            return "module_scope"
         if kind is CodeBlockKind.METHOD:
             return "method"
         return "function"
@@ -508,6 +523,8 @@ class CodeBlockDialog(QDialog):
     def _return_label(self, block: CodeBlockSummary) -> str:
         if block.kind is CodeBlockKind.CLASS:
             return tr(self._language, "code_blocks.returns.class_na")
+        if block.kind is CodeBlockKind.MODULE_SCOPE:
+            return tr(self._language, "code_blocks.returns.module_scope_na")
         return block.return_summary or tr(self._language, "code_blocks.returns.not_declared")
 
     def _call_display(
@@ -635,15 +652,6 @@ class CodeBlockDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         layout.addWidget(self._agent_notes)
-        button_row = QWidget()
-        button_layout = QHBoxLayout(button_row)
-        button_layout.setContentsMargins(0, 0, 0, 0)
-        button_layout.setSpacing(8)
-        button_layout.addStretch(1)
-        button_layout.addWidget(self._configure_model_button)
-        button_layout.addWidget(self._run_translation_button)
-        button_layout.addWidget(self._export_task_bundle_button)
-        layout.addWidget(button_row)
         return self._build_section_card(self._agent_notes_title, container, include_title=False)
 
     def _build_section_card(self, title_label: QLabel, widget: QWidget, *, include_title: bool = True) -> QFrame:
@@ -731,6 +739,7 @@ class CodeBlockDialog(QDialog):
             return
 
         self._export_task_bundle_button.setEnabled(False)
+        self._run_optimization_button.setEnabled(False)
         self._run_translation_button.setEnabled(False)
         fallback_items = fallback_reasons or [tr(self._language, "code_blocks.placeholder.no_agent_notes")]
         for item_text in fallback_items:
@@ -750,6 +759,7 @@ class CodeBlockDialog(QDialog):
     def _handle_task_candidate_selection_changed(self) -> None:
         candidate = self._selected_task_candidate()
         self._export_task_bundle_button.setEnabled(candidate is not None)
+        self._run_optimization_button.setEnabled(candidate is not None and candidate.mode is TaskMode.OPTIMIZE)
         self._run_translation_button.setEnabled(candidate is not None and candidate.mode is TaskMode.TRANSLATE)
 
     def _export_selected_task_bundle(self) -> None:
@@ -822,6 +832,41 @@ class CodeBlockDialog(QDialog):
             ),
         )
 
+    def _run_selected_optimization(self) -> None:
+        candidate = self._selected_task_candidate()
+        if candidate is None or self._graph is None or candidate.mode is not TaskMode.OPTIMIZE:
+            self._run_optimization_button.setEnabled(False)
+            return
+
+        bundle = build_task_bundle(self._graph, candidate)
+        config = self._resolve_translation_config(interactive=True)
+        if config is None:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            result = execute_optimization(bundle, project_root=self._project_root, config=config)
+        except (OptimizationConfigError, OptimizationExecutionError, OSError) as error:
+            QMessageBox.warning(
+                self,
+                tr(self._language, "task.dialog.optimize_error_title"),
+                tr(self._language, "task.dialog.optimize_error_body", error=str(error)),
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        QMessageBox.information(
+            self,
+            tr(self._language, "task.dialog.optimize_success_title"),
+            tr(
+                self._language,
+                "task.dialog.optimize_success_body",
+                status=result.status.value,
+                validation_status=result.validation_report.status.value,
+                path=result.output_dir,
+            ),
+        )
+
     def _open_model_config_dialog(self) -> None:
         self._resolve_translation_config(interactive=True, force_dialog=True)
 
@@ -856,6 +901,7 @@ class CodeBlockDialog(QDialog):
             "class": "background:#213a67;color:#d4e1ff;border:1px solid #517ae8;",
             "function": "background:#154368;color:#bce6ff;border:1px solid #3ea0e5;",
             "method": "background:#18473f;color:#b9f4dd;border:1px solid #34c38f;",
+            "module_scope": "background:#4f234e;color:#f4ccff;border:1px solid #c86dff;",
             "good": "background:#103629;color:#9ef0c8;border:1px solid #34c38f;",
             "caution": "background:#4b3512;color:#ffdca8;border:1px solid #f2a93b;",
             "avoid": "background:#4a1820;color:#ffc3cb;border:1px solid #ff6b78;",
