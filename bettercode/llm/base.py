@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, List, Any
-from .schemas import Message, LLMResponse, StreamChunk
-from .config import LLMConfig
+from llm.schemas import Message, LLMResponse, StreamChunk
+from llm.config import LLMConfig
 
 class BaseLLMClient(ABC):
     """Abstract base class for LLM clients."""
