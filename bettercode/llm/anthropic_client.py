@@ -2,8 +2,8 @@
 import time
 from typing import AsyncIterator, List, Tuple, Any
 from anthropic import AsyncAnthropic
-from llm.base import BaseLLMClient
-from llm.schemas import Message, MessageRole, LLMResponse, StreamChunk, TokenUsage
+from .base import BaseLLMClient
+from .schemas import Message, MessageRole, LLMResponse, StreamChunk, TokenUsage
 
 
 class AnthropicClient(BaseLLMClient):

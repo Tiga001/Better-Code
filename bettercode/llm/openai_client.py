@@ -1,8 +1,8 @@
 import time
 from typing import AsyncIterator, List, Any
 from openai import AsyncOpenAI
-from llm.base import BaseLLMClient
-from llm.schemas import Message, LLMResponse, StreamChunk, TokenUsage
+from .base import BaseLLMClient
+from .schemas import Message, LLMResponse, StreamChunk, TokenUsage
 
 
 class OpenAIClient(BaseLLMClient):

@@ -23,16 +23,8 @@ class LLMConfig(BaseSettings):
     # Timeout in seconds for API requests (default: 60.0)
     timeout: float = 60.0
 
-    @property
-    def provider(self) -> str:
-        """
-        Auto-detect the provider based on the base_url.
-        If base_url contains 'anthropic.com', returns 'anthropic'.
-        Otherwise returns 'openai'.
-        """
-        if self.base_url and "anthropic.com" in self.base_url:
-            return "anthropic"
-        return "openai"
+    # 显式指定厂商（例如 "openai", "anthropic"），不再通过 URL 猜测
+    provider: str = "openai"
 
     # Pydantic settings configuration
     model_config = SettingsConfigDict(
@@ -41,4 +33,3 @@ class LLMConfig(BaseSettings):
         extra="ignore",            # Ignore extra environment variables
         env_prefix="LLM_"          # Prefix for all environment variables
     )
-

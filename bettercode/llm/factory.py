@@ -1,26 +1,25 @@
-from llm.config import LLMConfig
-from llm.base import BaseLLMClient
-from llm.openai_client import OpenAIClient
-from llm.anthropic_client import AnthropicClient
+from .config import LLMConfig
+from .base import BaseLLMClient
+from .openai_client import OpenAIClient
+from .anthropic_client import AnthropicClient
+from .config_manager import config_manager  # 新增导入
 
-def create_llm_client(config: LLMConfig | None = None) -> BaseLLMClient:
+def create_llm_client(model_id: str) -> BaseLLMClient:
     """
-    Create the appropriate LLM client based on the provided configuration.
+    Create the appropriate LLM client based on the model ID.
 
-    If no config is provided, it will be built from environment variables (or .env file).
+    The model ID is used to look up the full configuration (api_key, base_url, provider)
+    from the config manager (YAML or environment variables).
 
     Args:
-        config: Optional LLMConfig instance. If None, a default config is created.
+        model_id: The model identifier (e.g., "gpt-4o", "claude-3-sonnet")
 
     Returns:
-        An instance of a concrete client (OpenAIClient or AnthropicClient).
+        An instance of a concrete client (OpenAIClient or AnthropicClient)
     """
-    # Use default config if none provided
-    cfg = config or LLMConfig()
+    config = config_manager.get_model_config(model_id)
 
-    # Check provider type from configuration
-    if cfg.provider == "anthropic":
-        return AnthropicClient(cfg)
+    if config.provider == "anthropic":
+        return AnthropicClient(config)
 
-    # Default to OpenAI-compatible client (works with OpenAI, DeepSeek, etc.)
-    return OpenAIClient(cfg)
+    return OpenAIClient(config)

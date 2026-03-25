@@ -4,10 +4,22 @@ version = "0.1.0"
 description = "Pure Python desktop project structure explorer."
 requires-python = ">=3.11"
 dependencies = [
+  "anthropic>=0.86.0",
+  "openai>=2.29.0",
+  "pydantic-settings>=2.13.1",
   "PySide6>=6.8",
+  "pyyaml>=6.0.3",
+  "rich>=14.3.3",
+  "typer>=0.24.1",
 ]
+
+[project.scripts]
+bettercode = "bettercode.cli.main:run"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = { find = { include = ["bettercode"], exclude = ["test_projects*"] } }
 
