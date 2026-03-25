@@ -1,4 +1,3 @@
-# bettercode/llm/anthropic_client.py
 import time
 from typing import AsyncIterator, List, Tuple, Any
 from anthropic import AsyncAnthropic

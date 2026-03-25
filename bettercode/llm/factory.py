@@ -1,5 +1,5 @@
 from .base import BaseLLMClient
-from .config_manager import config_manager  # 新增导入
+from .config_manager import config_manager  # Config loader singleton.
 
 def create_llm_client(model_id: str) -> BaseLLMClient:
     """

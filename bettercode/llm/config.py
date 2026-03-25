@@ -23,7 +23,7 @@ class LLMConfig(BaseSettings):
     # Timeout in seconds for API requests (default: 60.0)
     timeout: float = 200.0
 
-    # 显式指定厂商（例如 "openai", "anthropic"），不再通过 URL 猜测
+    # Explicit provider name (e.g., "openai", "anthropic"), no URL-based inference.
     provider: str = "openai"
 
     # Pydantic settings configuration

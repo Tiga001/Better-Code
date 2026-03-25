@@ -20,18 +20,18 @@ def modelconfig(
     """
     provider = provider.lower()
     
-    # 获取现有配置（如果有），方便做增量更新
+    # Load existing config (if any) to support incremental updates.
     existing_config = config_manager.get_model_config(model_id, default_provider=provider)
     
     new_api_key = api_key if api_key is not None else existing_config.api_key
     new_base_url = base_url if base_url is not None else existing_config.base_url
     
-    # 强制检查：如果是全新配置，必须要给 API Key
+    # Enforce API key on first-time configuration.
     if not new_api_key:
         console.print(f"[bold red]Error:[/bold red] API Key is required for new model '{model_id}'. Please use -k to provide it.")
         raise typer.Exit(code=1)
 
-    # 创建配置对象
+    # Build updated config object.
     updated_config = LLMConfig(
         model_id=model_id,
         api_key=new_api_key,
@@ -39,10 +39,10 @@ def modelconfig(
         provider=provider
     )
     
-    # 保存到 config.yaml（现在是以 model_id 为键）
+    # Save to config.yaml (keyed by model_id).
     config_manager.save_config(updated_config)
     
-    # 打印成功信息，打码 API Key
+    # Print success info with masked API key.
     masked_key = f"{updated_config.api_key[:4]}...{updated_config.api_key[-4:]}" if len(updated_config.api_key) > 8 else "..."
     
     details = (
