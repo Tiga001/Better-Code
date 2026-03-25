@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default="你好，请回复一句：连接测试成功。",
+        default="你好，请回复一句：连接测试成功。然后介绍自己。",
         help="User prompt sent to the model.",
     )
     parser.add_argument(
@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--show-reasoning",
         action="store_true",
+        default=True,
         help="Print reasoning content when the model provides it.",
     )
     return parser.parse_args()
@@ -65,7 +66,7 @@ async def main() -> None:
     if not response.content:
         print("warning: final content is empty; try increasing --max-tokens")
     if args.show_reasoning and response.reasoning_content:
-        print("\n=== Reasoning (if provided) ===")
+        print("\n=== Reasoning ===")
         print(response.reasoning_content)
 
 
