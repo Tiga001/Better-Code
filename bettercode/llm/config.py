@@ -21,7 +21,7 @@ class LLMConfig(BaseSettings):
     base_url: Optional[str] = None
 
     # Timeout in seconds for API requests (default: 60.0)
-    timeout: float = 60.0
+    timeout: float = 200.0
 
     # 显式指定厂商（例如 "openai", "anthropic"），不再通过 URL 猜测
     provider: str = "openai"
@@ -31,5 +31,6 @@ class LLMConfig(BaseSettings):
         env_file=".env",           # Load from .env file
         env_file_encoding="utf-8", # File encoding
         extra="ignore",            # Ignore extra environment variables
-        env_prefix="LLM_"          # Prefix for all environment variables
+        env_prefix="LLM_",         # Prefix for all environment variables
+        protected_namespaces=("settings_",)  # Allow fields like `model_id`
     )

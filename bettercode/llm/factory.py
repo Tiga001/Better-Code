@@ -1,7 +1,4 @@
-from .config import LLMConfig
 from .base import BaseLLMClient
-from .openai_client import OpenAIClient
-from .anthropic_client import AnthropicClient
 from .config_manager import config_manager  # 新增导入
 
 def create_llm_client(model_id: str) -> BaseLLMClient:
@@ -20,6 +17,21 @@ def create_llm_client(model_id: str) -> BaseLLMClient:
     config = config_manager.get_model_config(model_id)
 
     if config.provider == "anthropic":
+        try:
+            from .anthropic_client import AnthropicClient
+        except ImportError as exc:
+            raise ImportError(
+                "Anthropic client dependencies are missing. "
+                "Install with: pip install anthropic"
+            ) from exc
         return AnthropicClient(config)
+
+    try:
+        from .openai_client import OpenAIClient
+    except ImportError as exc:
+        raise ImportError(
+            "OpenAI-compatible client dependencies are missing. "
+            "Install with: pip install openai"
+        ) from exc
 
     return OpenAIClient(config)
