@@ -116,8 +116,8 @@ class OptimizeExecutorTests(unittest.TestCase):
             }
 
             with patch(
-                "bettercode.optimize_executor.urlopen",
-                return_value=_FakeHttpResponse(response_payload),
+                "bettercode.optimize_executor._post_model_request",
+                return_value=response_payload,
             ):
                 result = execute_optimization(
                     bundle,
@@ -215,8 +215,8 @@ class OptimizeExecutorTests(unittest.TestCase):
             }
 
             with patch(
-                "bettercode.optimize_executor.urlopen",
-                return_value=_FakeHttpResponse(response_payload),
+                "bettercode.optimize_executor._post_model_request",
+                return_value=response_payload,
             ):
                 result = execute_optimization(
                     bundle,
@@ -298,8 +298,8 @@ class OptimizeExecutorTests(unittest.TestCase):
             }
 
             with patch(
-                "bettercode.optimize_executor.urlopen",
-                return_value=_FakeHttpResponse(response_payload),
+                "bettercode.optimize_executor._post_model_request",
+                return_value=response_payload,
             ):
                 result = execute_optimization(
                     package,
@@ -386,8 +386,8 @@ class OptimizeExecutorTests(unittest.TestCase):
             }
 
             with patch(
-                "bettercode.optimize_executor.urlopen",
-                return_value=_FakeHttpResponse(response_payload),
+                "bettercode.optimize_executor._post_model_request",
+                return_value=response_payload,
             ):
                 result = execute_optimization(
                     bundle,
@@ -473,8 +473,8 @@ class OptimizeExecutorTests(unittest.TestCase):
             }
 
             with patch(
-                "bettercode.optimize_executor.urlopen",
-                return_value=_FakeHttpResponse(response_payload),
+                "bettercode.optimize_executor._post_model_request",
+                return_value=response_payload,
             ):
                 result = execute_optimization(
                     bundle,
@@ -539,8 +539,8 @@ class OptimizeExecutorTests(unittest.TestCase):
             }
 
             with patch(
-                "bettercode.optimize_executor.urlopen",
-                side_effect=[_FakeHttpResponse(bad_response), _FakeHttpResponse(good_response)],
+                "bettercode.optimize_executor._post_model_request",
+                side_effect=[bad_response, good_response],
             ):
                 result = execute_optimization(
                     bundle,
@@ -585,8 +585,8 @@ class OptimizeExecutorTests(unittest.TestCase):
             bad_response_2 = {"choices": [{"message": {"content": "not-json-at-all"}}]}
 
             with patch(
-                "bettercode.optimize_executor.urlopen",
-                side_effect=[_FakeHttpResponse(bad_response_1), _FakeHttpResponse(bad_response_2)],
+                "bettercode.optimize_executor._post_model_request",
+                side_effect=[bad_response_1, bad_response_2],
             ):
                 result = execute_optimization(
                     bundle,
@@ -653,8 +653,8 @@ class OptimizeExecutorTests(unittest.TestCase):
             }
 
             with patch(
-                "bettercode.optimize_executor.urlopen",
-                return_value=_FakeHttpResponse(response_payload),
+                "bettercode.optimize_executor._post_model_request",
+                return_value=response_payload,
             ):
                 result = execute_optimization(
                     bundle,

@@ -1,0 +1,11 @@
+deepseek-chat:
+  api_key: sk-xxxxx
+  base_url: https://api.deepseek.com/v1
+  provider: deepseek
+  model_id: deepseek-chat
+claude-3-sonnet:
+  api_key: sk-ant-xxx
+  base_url: null
+  provider: anthropic
+  model_id: claude-3-sonnet
+

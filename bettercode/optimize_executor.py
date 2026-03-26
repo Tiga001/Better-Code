@@ -10,9 +10,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
+from bettercode.llm.gateway import LLMGatewayError, request_chat_completion
 from bettercode.models import CodeBlockKind, TaskBundle, TaskMode, TaskTargetBlock, TaskUnitPackage
 from bettercode.task_graph import task_unit_package_to_dict
 from bettercode.task_planner import task_bundle_to_dict
@@ -634,25 +633,51 @@ def _post_model_request(
     api_payload: dict[str, Any],
     timeout_seconds: float,
 ) -> dict[str, Any]:
-    request = Request(
-        api_url,
-        data=json.dumps(api_payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+    model_id = str(api_payload.get("model", "")).strip()
+    messages = api_payload.get("messages")
+    if not model_id:
+        raise OptimizationExecutionError("Model request payload is missing model.")
+    if not isinstance(messages, list):
+        raise OptimizationExecutionError("Model request payload is missing messages list.")
+
+    temperature_raw = api_payload.get("temperature", 0.7)
+    max_tokens_raw = api_payload.get("max_tokens")
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        raise OptimizationExecutionError(f"Model API returned HTTP {error.code}: {body}") from error
-    except URLError as error:
-        raise OptimizationExecutionError(f"Could not reach model API: {error.reason}") from error
-    except json.JSONDecodeError as error:
-        raise OptimizationExecutionError("Model API returned non-JSON HTTP payload.") from error
+        temperature = float(temperature_raw)
+    except (TypeError, ValueError) as error:
+        raise OptimizationExecutionError(f"Invalid temperature in request payload: {temperature_raw}") from error
+
+    max_tokens: int | None = None
+    if max_tokens_raw is not None:
+        try:
+            max_tokens = int(max_tokens_raw)
+        except (TypeError, ValueError) as error:
+            raise OptimizationExecutionError(f"Invalid max_tokens in request payload: {max_tokens_raw}") from error
+
+    try:
+        result = request_chat_completion(
+            model_id=model_id,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+        )
+    except LLMGatewayError as error:
+        raise OptimizationExecutionError(str(error)) from error
+
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": result.content,
+                    "reasoning_content": result.reasoning_content,
+                }
+            }
+        ],
+        "model": result.model,
+        "usage": result.usage,
+        "latency_ms": result.latency_ms,
+    }
 
 
 def _extract_message_content(response_payload: dict[str, Any]) -> str:

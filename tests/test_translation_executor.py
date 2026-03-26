@@ -109,8 +109,8 @@ class TranslationExecutorTests(unittest.TestCase):
             }
 
             with patch(
-                "bettercode.translation_executor.urlopen",
-                return_value=_FakeHttpResponse(response_payload),
+                "bettercode.translation_executor._post_translation_request",
+                return_value=response_payload,
             ):
                 result = execute_translation(
                     bundle,
