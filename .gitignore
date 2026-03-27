@@ -8,3 +8,6 @@ generated/
 config/*.yaml
 config/*.yml
 .DS_Store
+bettercode/.env
+*.egg-info/
+bettercode.egg-info/
