@@ -7,3 +7,4 @@ dist/
 generated/
 config/*.yaml
 config/*.yml
+.DS_Store
