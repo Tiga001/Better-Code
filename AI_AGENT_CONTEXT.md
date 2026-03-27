@@ -30,17 +30,12 @@ Known-good local regression at time of writing:
 
 Current working tree status at time of writing:
 
-- untracked packaging-related files exist:
-  - `.github/`
-  - `BetterCode.spec`
-  - `scripts/`
-- untracked mac finder artifact:
-  - `.DS_Store`
+- working tree should be kept clean before collaboration handoff
 
 Interpretation:
 
 - the core application and tests are green
-- packaging scaffolding exists locally but may not yet be committed
+- collaboration should happen against a clean repo state
 
 ## 2. Core Runtime Entry Points
 
@@ -317,24 +312,7 @@ Important:
 
 If adding logs/debugging, do not write real tokens into repository files.
 
-## 10. Packaging Status
-
-Packaging work exists locally:
-
-- spec: `/Users/shenhuajiao/PycharmProjects/BetterCode/BetterCode.spec`
-- build script: `/Users/shenhuajiao/PycharmProjects/BetterCode/scripts/build_desktop.py`
-- GitHub Actions workflow scaffold: `/Users/shenhuajiao/PycharmProjects/BetterCode/.github/workflows/build-desktop.yml`
-
-Known local outcome:
-
-- mac build path produced:
-  - `/Users/shenhuajiao/PycharmProjects/BetterCode/dist/BetterCode.app`
-
-Windows `.exe` is not produced locally on macOS; workflow scaffold is intended for Windows runners.
-
-At time of writing these packaging files are local/untracked unless later committed.
-
-## 11. Test Suite Map
+## 10. Test Suite Map
 
 Representative test files:
 
@@ -365,7 +343,7 @@ Representative test files:
 
 Agents should extend the closest test file instead of creating random new test locations.
 
-## 12. High-Risk Areas
+## 11. High-Risk Areas
 
 If changing these, read the existing code first:
 
@@ -397,7 +375,7 @@ If changing these, read the existing code first:
    - current mode switching
    - running state UI
 
-## 13. Known Open Product Gaps
+## 12. Known Open Product Gaps
 
 These are not bugs unless the task explicitly targets them:
 
@@ -408,7 +386,7 @@ These are not bugs unless the task explicitly targets them:
 - no true agent orchestration layer yet
 - no project-specific validation command configuration yet
 
-## 14. Recommended Development Heuristics For New Agents
+## 13. Recommended Development Heuristics For New Agents
 
 1. Do not add new abstractions if an existing dataclass/model already fits.
 2. Prefer improving the current task / batch / optimization pipeline over adding new UI chrome.
@@ -422,7 +400,7 @@ These are not bugs unless the task explicitly targets them:
 7. When touching parser/task graph semantics, update parser/task graph tests.
 8. Treat generated artifacts as outputs, not source inputs.
 
-## 15. Fast Start Commands For Agents
+## 14. Fast Start Commands For Agents
 
 ```bash
 cd /Users/shenhuajiao/PycharmProjects/BetterCode
@@ -430,12 +408,6 @@ python3 -m unittest discover -s tests
 python3 app.py
 ```
 
-Optional packaging command:
-
-```bash
-python3 scripts/build_desktop.py
-```
-
-## 16. If You Need One-Line Intent
+## 15. If You Need One-Line Intent
 
 BetterCode is a Python-first code operations workbench: parse the repo, decompose it into ordered tasks, let AI propose changes safely, then preview/validate/apply/rollback those changes with a UI that exposes the graph and execution state.
