@@ -2,6 +2,7 @@
 import typer
 
 # Import the command function from separate module
+from .cmd_analyze_project import analyze_project
 from .cmd_config import modelconfig
 
 # Create the main CLI application
@@ -12,6 +13,7 @@ app = typer.Typer(
 )
 
 app.command(name="config")(modelconfig)
+app.command(name="analyze-project")(analyze_project)
 
 @app.callback()
 def main_callback():
