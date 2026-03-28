@@ -1,2 +1,0 @@
-[console_scripts]
-bettercode = bettercode.cli.main:run
