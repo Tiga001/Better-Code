@@ -28,8 +28,8 @@ class LLMConfigManager:
         self.legacy_env_file = self.project_root / "bettercode" / ".env"
         self.global_env_file = Path.home() / ".config" / "bettercode" / ".env"
 
-        self._load_env_files()
         self._local_configs: Dict[str, Dict[str, Any]] = self._load()
+        self._env_entries_cache: Dict[str, str] | None = None
 
     def _load(self) -> Dict[str, Dict[str, Any]]:
         if self.config_file.exists():
@@ -43,31 +43,27 @@ class LLMConfigManager:
                 return {}
         return {}
 
-    def _load_env_files(self) -> None:
+    def _env_sources(self) -> list[Path]:
         # Priority: project root .env > legacy bettercode/.env > global .env
-        self._load_env_file(self.local_env_file)
-        self._load_env_file(self.legacy_env_file)
-        self._load_env_file(self.global_env_file)
+        return [self.local_env_file, self.legacy_env_file, self.global_env_file]
 
-    def _load_env_file(self, path: Path) -> None:
-        if not path.is_file():
-            return
-        for line in path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if stripped.startswith("export "):
-                stripped = stripped[len("export "):].strip()
-            if "=" not in stripped:
-                continue
-            key, value = stripped.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-            if not key or key in os.environ:
-                continue
-            if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-                value = value[1:-1]
-            os.environ[key] = value
+    def _env_entries(self) -> Dict[str, str]:
+        if self._env_entries_cache is not None:
+            return self._env_entries_cache
+        merged: Dict[str, str] = {}
+        for env_file in self._env_sources():
+            for key, value in self._read_env_entries(env_file).items():
+                # Keep the first value found according to source priority.
+                if key not in merged:
+                    merged[key] = value
+        self._env_entries_cache = merged
+        return merged
+
+    def _lookup_env_var(self, key: str) -> str:
+        value = os.getenv(key)
+        if value is not None:
+            return value
+        return self._env_entries().get(key, "")
 
     def save_config(self, config: LLMConfig) -> None:
         """Save config into YAML, keyed by model_id at the top level."""
@@ -109,6 +105,7 @@ class LLMConfigManager:
         entries = self._read_env_entries(env_file)
         entries[env_name] = api_key
         self._write_env_entries(env_file, entries)
+        self._env_entries_cache = None
         os.environ[env_name] = api_key
         return env_file
 
@@ -144,7 +141,7 @@ class LLMConfigManager:
             env_name = raw_value.split("ENV:", 1)[1].strip()
             if not env_name:
                 raise ValueError("api_key reference is invalid. Expected format: ENV:VAR_NAME")
-            resolved = os.getenv(env_name, "").strip()
+            resolved = self._lookup_env_var(env_name).strip()
             if not resolved:
                 raise ValueError(f"Missing API key environment variable: {env_name}")
             return resolved
@@ -176,9 +173,9 @@ class LLMConfigManager:
         prefix = default_provider.upper() if default_provider else "OPENAI"
         
         return LLMConfig(
-            model_id=os.getenv(f"{prefix}_MODEL_ID", model_id),
-            api_key=os.getenv(f"{prefix}_API_KEY", ""),
-            base_url=os.getenv(f"{prefix}_BASE_URL"),
+            model_id=self._lookup_env_var(f"{prefix}_MODEL_ID") or model_id,
+            api_key=self._lookup_env_var(f"{prefix}_API_KEY"),
+            base_url=self._lookup_env_var(f"{prefix}_BASE_URL") or None,
             provider=default_provider or "openai"
         )
 

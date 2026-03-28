@@ -37,19 +37,10 @@ def load_model_config() -> ModelConfig:
         llm_api_url = ""
         llm_api_key = ""
 
-    api_url = (
-        os.environ.get("BETTERCODE_MODEL_API_URL")
-        or _read_setting(settings, "api_url")
-        or llm_api_url
-        or DEFAULT_MODEL_API_URL
-    )
-    api_token = (
-        os.environ.get("BETTERCODE_MODEL_API_TOKEN")
-        or os.environ.get("API_TOKEN")
-        or llm_api_key
-        or _read_setting(settings, "api_token")
-        or ""
-    )
+    # Keep a single source of truth for credentials/base URL:
+    # env overrides > unified LLM config (config.yaml + ENV references).
+    api_url = os.environ.get("BETTERCODE_MODEL_API_URL") or llm_api_url or DEFAULT_MODEL_API_URL
+    api_token = os.environ.get("BETTERCODE_MODEL_API_TOKEN") or llm_api_key or ""
 
     return ModelConfig(
         api_url=api_url.strip(),
