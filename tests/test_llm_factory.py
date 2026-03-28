@@ -98,3 +98,40 @@ class LLMFactoryTests(unittest.TestCase):
         self.assertEqual(client.config.provider, "openai")
         self.assertEqual(client.config.api_key, "test-openai-key")
         self.assertEqual(client.config.base_url, "https://api.openai.example/v1")
+
+    def test_config_manager_does_not_mutate_os_environ_on_init_but_can_resolve_env_reference(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+
+        root = Path(temporary_directory.name)
+        (root / "bettercode" / "config").mkdir(parents=True, exist_ok=True)
+        (root / "bettercode" / "config" / "config.yaml").write_text(
+            textwrap.dedent(
+                """
+                gpt-4o-mini:
+                  model_id: gpt-4o-mini
+                  provider: openai
+                  api_key: ENV:BETTERCODE_API_KEY_GPT_4O_MINI
+                  base_url: https://api.openai.example/v1
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (root / ".env").write_text("BETTERCODE_API_KEY_GPT_4O_MINI=from-dot-env\n", encoding="utf-8")
+
+        original = os.environ.pop("BETTERCODE_API_KEY_GPT_4O_MINI", None)
+        self.addCleanup(
+            lambda: (
+                os.environ.pop("BETTERCODE_API_KEY_GPT_4O_MINI", None)
+                if original is None
+                else os.environ.__setitem__("BETTERCODE_API_KEY_GPT_4O_MINI", original)
+            )
+        )
+
+        with working_directory(root):
+            manager = LLMConfigManager()
+            self.assertNotIn("BETTERCODE_API_KEY_GPT_4O_MINI", os.environ)
+            config = manager.get_model_config("gpt-4o-mini")
+
+        self.assertEqual(config.api_key, "from-dot-env")

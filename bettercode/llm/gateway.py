@@ -71,18 +71,21 @@ def request_chat_completion(
     timeout_seconds: float | None = None,
 ) -> ChatCompletionResult:
     try:
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise LLMGatewayError("timeout_seconds must be greater than 0.")
         normalized_messages = _normalize_messages(messages)
         client = create_llm_client(model_id)
         request_kwargs: dict[str, Any] = {}
         if max_tokens is not None:
             request_kwargs["max_tokens"] = max_tokens
-        response = _run_async(
-            client.achat(
-                messages=normalized_messages,
-                temperature=temperature,
-                **request_kwargs,
-            )
+        request_coroutine = client.achat(
+            messages=normalized_messages,
+            temperature=temperature,
+            **request_kwargs,
         )
+        if timeout_seconds is not None:
+            request_coroutine = asyncio.wait_for(request_coroutine, timeout=timeout_seconds)
+        response = _run_async(request_coroutine)
     except Exception as error:  # pragma: no cover - exercised via callers
         raise LLMGatewayError(f"LLM gateway request failed: {error}") from error
 
