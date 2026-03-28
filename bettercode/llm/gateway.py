@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import asyncio
 import threading
 from dataclasses import dataclass
@@ -11,6 +12,45 @@ from .schemas import Message, MessageRole
 
 class LLMGatewayError(RuntimeError):
     pass
+
+
+class _BackgroundEventLoop:
+    def __init__(self) -> None:
+        self._ready = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True, name="bettercode-llm-loop")
+        self._thread.start()
+        self._ready.wait()
+
+    def submit(self, coroutine):
+        if self._loop is None:
+            raise LLMGatewayError("Background event loop is not available.")
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        return future.result()
+
+    def close(self) -> None:
+        if self._loop is None:
+            return
+        if self._loop.is_closed():
+            return
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._ready.set()
+        self._loop.run_forever()
+        pending = asyncio.all_tasks(self._loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        self._loop.close()
+
+
+_BACKGROUND_LOOP = _BackgroundEventLoop()
+atexit.register(_BACKGROUND_LOOP.close)
 
 
 @dataclass(slots=True)
@@ -73,24 +113,4 @@ def _normalize_messages(messages: list[dict[str, Any]]) -> list[Message]:
 
 
 def _run_async(coroutine):
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coroutine)
-
-    result_holder: dict[str, Any] = {}
-    error_holder: dict[str, BaseException] = {}
-
-    def _runner() -> None:
-        try:
-            result_holder["value"] = asyncio.run(coroutine)
-        except BaseException as error:  # pragma: no cover - defensive path
-            error_holder["error"] = error
-
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
-    thread.join()
-
-    if "error" in error_holder:
-        raise error_holder["error"]
-    return result_holder["value"]
+    return _BACKGROUND_LOOP.submit(coroutine)

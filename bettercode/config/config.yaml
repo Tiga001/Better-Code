@@ -1,11 +1,20 @@
 deepseek-chat:
-  api_key: sk-xxxxx
+  api_key: ENV:BETTERCODE_API_KEY_DEEPSEEK_CHAT
   base_url: https://api.deepseek.com/v1
   provider: deepseek
   model_id: deepseek-chat
-claude-3-sonnet:
-  api_key: sk-ant-xxx
+claude-3-7-sonnet:
+  api_key: ENV:BETTERCODE_API_KEY_CLAUDE_3_7_SONNET
   base_url: null
   provider: anthropic
-  model_id: claude-3-sonnet
-
+  model_id: claude-3-7-sonnet
+deepseek-ai/DeepSeek-R1-0528:
+  api_key: ENV:BETTERCODE_API_KEY_DEEPSEEK_AI_DEEPSEEK_R1_0528
+  base_url: https://api-inference.modelscope.cn/v1
+  provider: openai
+  model_id: deepseek-ai/DeepSeek-R1-0528
+moonshot-v1-8k:
+  api_key: ENV:BETTERCODE_API_KEY_MOONSHOT_V1_8K
+  base_url: https://api.moonshot.cn/v1
+  provider: openai
+  model_id: moonshot-v1-8k
