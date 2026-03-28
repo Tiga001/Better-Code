@@ -18,3 +18,8 @@ moonshot-v1-8k:
   base_url: https://api.moonshot.cn/v1
   provider: openai
   model_id: moonshot-v1-8k
+glm-4-plus:
+  api_key: ENV:BETTERCODE_API_KEY_GLM_4_PLUS
+  base_url: https://open.bigmodel.cn/api/paas/v4
+  provider: openai
+  model_id: glm-4-plus
