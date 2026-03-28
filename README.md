@@ -57,6 +57,8 @@ python3 -m unittest discover -s tests
 ### LLM 适配方式（当前）
 
 - 统一配置：`bettercode/config/config.yaml`（按 `model_id` 管理）
+- `config.yaml` 中 `api_key` 使用 `ENV:VAR_NAME` 引用，不存明文 key
+- 真实 key 默认存放在项目根目录 `.env`
 - 统一客户端工厂：`bettercode/llm/factory.py`
 - 统一调用网关：`bettercode/llm/gateway.py`
 - 执行器接入：
@@ -76,7 +78,7 @@ python3 -m unittest discover -s tests
 ### 模型配置与连通性检查
 
 ```bash
-python3 -m bettercode.cli.main config --model <model_id> --provider <provider> --api-key <api_key> [--base-url <url>]
+python3 -m bettercode.cli.main config --model <model_id> --provider <provider> --api-key <api_key> [--api-key-env <ENV_VAR_NAME>] [--base-url <url>]
 python3 tests/test_llm_client.py --model <model_id> --prompt "连接测试"
 ```
 
@@ -158,6 +160,8 @@ python3 -m unittest discover -s tests
 ### LLM Integration (Current)
 
 - Unified config: `bettercode/config/config.yaml` (keyed by `model_id`)
+- `api_key` in `config.yaml` is stored as `ENV:VAR_NAME` reference, not plaintext
+- Real API keys are stored in the project-root `.env` by default
 - Unified client factory: `bettercode/llm/factory.py`
 - Unified gateway: `bettercode/llm/gateway.py`
 - Executor integration:
@@ -177,7 +181,7 @@ Note: translation and optimization executors now call the shared LLM gateway ins
 ### Model Config and Connectivity Check
 
 ```bash
-python3 -m bettercode.cli.main config --model <model_id> --provider <provider> --api-key <api_key> [--base-url <url>]
+python3 -m bettercode.cli.main config --model <model_id> --provider <provider> --api-key <api_key> [--api-key-env <ENV_VAR_NAME>] [--base-url <url>]
 python3 tests/test_llm_client.py --model <model_id> --prompt "connectivity check"
 ```
 
