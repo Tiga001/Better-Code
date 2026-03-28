@@ -9,3 +9,7 @@ config/*.yaml
 config/*.yml
 .env
 bettercode/.env
+.DS_Store
+bettercode/.env
+*.egg-info/
+bettercode.egg-info/
